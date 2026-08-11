@@ -42,6 +42,8 @@ pub(crate) struct DroidInstallPaths {
 #[derive(Debug)]
 pub(crate) struct OpenCodeInstallPaths {
     pub plugin_path: PathBuf,
+    pub tui_plugin_path: PathBuf,
+    pub tui_config_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -93,6 +95,20 @@ pub(crate) struct MastracodeUninstallResult {
     pub hooks_path: PathBuf,
     pub removed_hook_file: bool,
     pub updated_hooks: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct GrokInstallPaths {
+    pub hook_path: PathBuf,
+    pub config_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct GrokUninstallResult {
+    pub hook_path: PathBuf,
+    pub config_path: PathBuf,
+    pub removed_hook_file: bool,
+    pub removed_config_file: bool,
 }
 
 #[derive(Debug)]
@@ -211,7 +227,11 @@ pub(crate) struct DroidUninstallResult {
 #[derive(Debug)]
 pub(crate) struct OpenCodeUninstallResult {
     pub plugin_path: PathBuf,
+    pub tui_plugin_path: PathBuf,
+    pub tui_config_path: PathBuf,
     pub removed_plugin: bool,
+    pub removed_tui_plugin: bool,
+    pub updated_tui_config: bool,
 }
 
 #[derive(Debug)]
@@ -226,4 +246,18 @@ pub(crate) struct HermesUninstallResult {
     pub config_path: PathBuf,
     pub removed_plugin_dir: bool,
     pub updated_config: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct AntigravityCliInstallPaths {
+    pub hook_path: PathBuf,
+    pub hooks_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct AntigravityCliUninstallResult {
+    pub hook_path: PathBuf,
+    pub hooks_path: PathBuf,
+    pub removed_hook_file: bool,
+    pub updated_hooks: bool,
 }

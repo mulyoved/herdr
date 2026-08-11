@@ -53,6 +53,12 @@
           "description": "Override the panel_bg color token on top of the base theme. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
         },
         {
+          "key": "theme.custom.sidebar_bg",
+          "type": "color",
+          "default": "unset",
+          "description": "Set the desktop sidebar background without changing other panel surfaces. Accepts hex, named colors, rgb(r,g,b), or reset aliases."
+        },
+        {
           "key": "theme.custom.surface0",
           "type": "color",
           "default": "unset",
@@ -386,6 +392,18 @@
           "description": "Select the next tab."
         },
         {
+          "key": "keys.move_tab_previous",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Move the active tab one position toward the front. Unset by default."
+        },
+        {
+          "key": "keys.move_tab_next",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Move the active tab one position toward the back. Unset by default."
+        },
+        {
           "key": "keys.switch_tab",
           "type": "keybinding",
           "default": "\"prefix+1..9\"",
@@ -518,6 +536,30 @@
           "description": "Enter resize mode."
         },
         {
+          "key": "keys.resize_pane_left",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Resize the focused pane toward the left. Unset by default."
+        },
+        {
+          "key": "keys.resize_pane_down",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Resize the focused pane downward. Unset by default."
+        },
+        {
+          "key": "keys.resize_pane_up",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Resize the focused pane upward. Unset by default."
+        },
+        {
+          "key": "keys.resize_pane_right",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Resize the focused pane toward the right. Unset by default."
+        },
+        {
           "key": "keys.toggle_sidebar",
           "type": "keybinding",
           "default": "\"prefix+b\"",
@@ -597,7 +639,7 @@
           "key": "ui.copy_on_select",
           "type": "boolean",
           "default": "true",
-          "description": "Copy text selected with the mouse."
+          "description": "Automatically copy text selected by mouse drag or double-click. When disabled, Ctrl+C or a host-forwarded Cmd+C copies and clears the retained selection."
         },
         {
           "key": "ui.host_cursor",
@@ -653,6 +695,18 @@
           "description": "Draw borders around split panes."
         },
         {
+          "key": "ui.pane_outer_borders",
+          "type": "boolean",
+          "default": "true",
+          "description": "Draw borders along the outside edge of the pane area. Disable with pane gaps disabled for tmux-style internal splitters without an outside frame."
+        },
+        {
+          "key": "ui.pane_scrollbars",
+          "type": "boolean",
+          "default": "true",
+          "description": "Draw interactive scrollbars beside terminal panes. Disable to reclaim the scrollbar column and keep it out of terminal-native selections."
+        },
+        {
           "key": "ui.pane_gaps",
           "type": "boolean",
           "default": "true",
@@ -671,6 +725,41 @@
           "description": "Hide the tab row when the workspace has one tab."
         },
         {
+          "key": "ui.tab_bar_position",
+          "type": "enum",
+          "default": "\"top\"",
+          "description": "Place the desktop tab row above or below the terminal panes.",
+          "values": [
+            "top",
+            "bottom"
+          ]
+        },
+        {
+          "key": "ui.tab_bar_right",
+          "type": "array",
+          "default": "[]",
+          "description": "Configure ordered right-aligned tab bar entries. Supported types are zoom, hostname, datetime, text, and command.",
+          "values": [
+            "zoom",
+            "hostname",
+            "datetime",
+            "text",
+            "command"
+          ]
+        },
+        {
+          "key": "ui.tab_bar_right_separator",
+          "type": "string",
+          "default": "\" \"",
+          "description": "Text inserted between visible right-aligned tab bar entries."
+        },
+        {
+          "key": "ui.window_title",
+          "type": "string",
+          "default": "\"{hostname}: {workspace}\"",
+          "description": "Title Herdr writes to the terminal it runs in. Tokens: {hostname}, {workspace}, {tab}, {pane}, {terminal_title}. Empty leaves the outer title alone."
+        },
+        {
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",
@@ -678,6 +767,16 @@
           "values": [
             "spaces",
             "priority"
+          ]
+        },
+        {
+          "key": "ui.status_indicators",
+          "type": "enum",
+          "default": "\"dots\"",
+          "description": "Choose compact color dots or distinct static symbols for agent states.",
+          "values": [
+            "dots",
+            "symbols"
           ]
         },
         {
@@ -702,7 +801,7 @@
           "key": "ui.sidebar.spaces.row_gap",
           "type": "integer",
           "default": "0",
-          "description": "Blank terminal rows between expanded Space sidebar entries. Set to 1 to restore the previous spacing. Consecutive indented worktree children remain packed as one group."
+          "description": "Blank terminal rows between worktree groups and unrelated top-level Spaces. Worktree parents and their indented children remain packed."
         },
         {
           "key": "ui.sidebar.spaces.rows",
@@ -1113,7 +1212,7 @@
           "key": "experimental.switch_ascii_input_source_in_prefix",
           "type": "boolean",
           "default": "false",
-          "description": "While prefix mode is active, temporarily switch the macOS host input source to an ASCII-capable keyboard layout so prefix commands are read as ASCII even when a CJK IME is active, then restore the previous input source when prefix mode exits. macOS only; a no-op elsewhere and a best-effort no-op if the switch fails."
+          "description": "While prefix mode is active, temporarily switch the host input source to an ASCII-capable mode so prefix commands are read as ASCII even when an IME is active, then restore the previous input source when prefix mode exits. On macOS this selects the ASCII-capable keyboard layout; on Windows it switches the IME to English (ASCII) input. Windows support is currently limited to the Korean IME; with an IME for any other language, the input source is left unchanged. macOS and Windows only; a no-op elsewhere and a best-effort no-op if the switch fails."
         }
       ]
     }

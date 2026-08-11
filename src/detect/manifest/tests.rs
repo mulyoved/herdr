@@ -734,6 +734,40 @@ fn codex_osc_title_plain_is_idle() {
 }
 
 #[test]
+fn codex_trust_directory_requires_live_top_region() {
+    let screen = "> You are in C:\\Users\\user\\project\n\n\
+        Do you trust the contents of this\n\
+        directory? Working with untrusted\n\
+        contents comes with higher risk of\n\
+        prompt injection. Trusting the\n\
+        directory allows project-local config,\n\
+        hooks, and exec policies to load.\n\n\
+        › 1. Yes, continue\n\
+          2. No, quit\n\n\
+        Press enter to continue\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("trust_directory")
+    );
+    assert!(result.visible_blocker);
+
+    let transcript = "› > You are in C:\\Users\\user\\project\n\n\
+        Do you trust the contents of this\n\
+        directory? Working with untrusted contents comes with higher risk.\n";
+    let result = osc_explain(Agent::Codex, transcript, "project", "");
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_ne!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("trust_directory")
+    );
+    assert!(!result.visible_blocker);
+}
+
+#[test]
 fn codex_background_terminal_screen_does_not_override_osc_idle() {
     // Background terminal tasks can be long-lived helpers such as dev servers.
     // They should not make Codex look busy once the foreground turn is idle.
@@ -745,6 +779,126 @@ fn codex_background_terminal_screen_does_not_override_osc_idle() {
         Some("osc_title_idle")
     );
     assert!(result.visible_idle);
+}
+
+#[test]
+fn codex_screen_working_fallback_handles_static_osc_title() {
+    let screen = "• I’ll run it and wait for completion.\n\n\
+        ◦ Working (1m 16s • esc to interrupt) · 1 background…\n\n\
+        › Use /skills to list available skills\n\n\
+        gpt-5.6-sol default · /work\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("screen_working_fallback")
+    );
+    assert!(result.visible_working);
+}
+
+#[test]
+fn codex_osc_working_remains_preferred_over_screen_fallback() {
+    let screen = "• Working (4s • esc to interrupt)\n\n\
+        › Use /skills to list available skills\n\n\
+        gpt-5.6-sol default · /work\n";
+    let result = osc_explain(Agent::Codex, screen, "⠸ project", "");
+
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("osc_title_working")
+    );
+    assert!(result.visible_working);
+}
+
+#[test]
+fn codex_screen_blocker_outranks_working_fallback() {
+    let screen = "• Working (4s • esc to interrupt)\n\
+        › 1. Yes, proceed\n\
+        Press enter to confirm or esc to cancel\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("live_strong_blocker")
+    );
+    assert!(result.visible_blocker);
+    assert!(!result.visible_working);
+}
+
+#[test]
+fn codex_weak_blocker_outranks_working_fallback() {
+    let screen = "• Working (4s • esc to interrupt)\n\
+        do you want to continue? [y/n]\n\
+        › Use /skills to list available skills\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("weak_blocker")
+    );
+    assert!(!result.visible_working);
+}
+
+#[test]
+fn codex_transcript_viewer_outranks_working_fallback() {
+    let screen = "• Working (4s • esc to interrupt)\n\
+        › transcript\n\
+        ↑/↓ to scroll · pgup/pgdn to move · home/end to jump · q to quit · esc to edit prev\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Unknown);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("transcript_viewer")
+    );
+    assert!(result.skip_state_update);
+    assert!(!result.visible_working);
+}
+
+#[test]
+fn codex_screen_working_fallback_ignores_stale_and_prompt_text() {
+    let screens = [
+        "◦ Working (1m 16s • esc to interrupt)\n\
+         ■ Conversation interrupted\n\
+         › Use /skills to list available skills\n\
+         gpt-5.6-sol default · /work\n",
+        "› Explain the text ◦ Working (1m 16s • esc to interrupt)\n\
+         gpt-5.6-sol default · /work\n",
+        "  ◦ Working (1m 16s • esc to interrupt)\n\
+         › Use /skills to list available skills\n\
+         gpt-5.6-sol default · /work\n",
+    ];
+
+    for screen in screens {
+        let result = osc_explain(Agent::Codex, screen, "project", "");
+        assert_eq!(result.state, AgentState::Idle);
+        assert_eq!(
+            result.matched_rule.as_ref().map(|r| r.id.as_str()),
+            Some("osc_title_idle")
+        );
+        assert!(result.visible_idle);
+        assert!(!result.visible_working);
+    }
+}
+
+#[test]
+fn codex_screen_working_fallback_ignores_interrupted_short_terminal() {
+    let screen = "◦ Working (1m 16s • esc to interrupt)\n\
+        ■ Conversation interrupted\n\
+        ›\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("osc_title_idle")
+    );
+    assert!(result.visible_idle);
+    assert!(!result.visible_working);
 }
 
 #[test]

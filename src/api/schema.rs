@@ -75,6 +75,8 @@ pub enum Method {
     WorkspaceRename(WorkspaceRenameParams),
     #[serde(rename = "workspace.move")]
     WorkspaceMove(WorkspaceMoveParams),
+    #[serde(rename = "workspace.move_block")]
+    WorkspaceMoveBlock(WorkspaceMoveBlockParams),
     #[serde(rename = "workspace.report_metadata")]
     WorkspaceReportMetadata(WorkspaceReportMetadataParams),
     #[serde(rename = "workspace.close")]
@@ -109,16 +111,22 @@ pub enum Method {
     AgentRead(AgentReadParams),
     #[serde(rename = "agent.explain")]
     AgentExplain(AgentTarget),
-    #[serde(rename = "agent.send")]
-    AgentSend(AgentSendParams),
+    #[serde(rename = "agent.send_keys")]
+    AgentSendKeys(AgentSendKeysParams),
     #[serde(rename = "agent.rename")]
     AgentRename(AgentRenameParams),
+    #[serde(rename = "agent.view.set")]
+    AgentViewSet(AgentViewSetParams),
+    #[serde(rename = "agent.view.clear")]
+    AgentViewClear(AgentViewClearParams),
     #[serde(rename = "agent.focus")]
     AgentFocus(AgentTarget),
     #[serde(rename = "agent.start")]
     AgentStart(AgentStartParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
+    #[serde(rename = "agent.wait")]
+    AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.swap")]
@@ -153,6 +161,8 @@ pub enum Method {
     PaneGet(PaneTarget),
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
+    #[serde(rename = "pane.input.set")]
+    PaneInputSet(PaneInputSetParams),
     #[serde(rename = "pane.rename")]
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]
@@ -175,6 +185,9 @@ pub enum Method {
     #[serde(skip)]
     #[schemars(skip)]
     PaneGraphicsStreamSet(PaneGraphicsSetParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneGraphicsStreamDirect(PaneGraphicsDirectParams),
     #[serde(skip)]
     #[schemars(skip)]
     PaneGraphicsStreamOpen(PaneGraphicsStreamParams),

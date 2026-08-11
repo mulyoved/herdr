@@ -74,6 +74,9 @@ command = ["npm", "ci"]
 command = ["npm", "run", "build"]
 platforms = ["linux", "macos"]
 
+[[startup]]
+command = ["node", "dist/restore.js"]
+
 [[actions]]
 id = "apply"
 title = "Apply layout"
@@ -110,10 +113,10 @@ ASCII の英字、数字、コロン、アンダースコア、ハイフンが�
 一意な名前が必要なとき、Herdr はアクション id を `plugin.id.action` の形に修飾します。
 
 プラグインが動作する場所は `platforms = ["linux", "macos", "windows"]` で宣言します。
-ビルドコマンド、アクション、イベントフック、ペイン、リンクハンドラーも独自の
-`platforms` を宣言でき、項目レベルの platforms はトップレベルのリストを
-上書きします。トップレベルの `platforms` がないローカルプラグインは警告付きで
-リンクされます。
+ビルドコマンド、スタートアップフック、アクション、イベントフック、ペイン、
+リンクハンドラーも独自の `platforms` を宣言でき、項目レベルの platforms は
+トップレベルのリストを上書きします。トップレベルの `platforms` がないローカル
+プラグインは警告付きでリンクされます。
 
 `command` の値は argv 配列です。Herdr はこれをシェル経由で実行しないため、
 コマンド自身がシェルを起動しない限りシェル展開はありません。言語固有の挙動は
@@ -192,6 +195,11 @@ herdr plugin log list --plugin example.layout
 ビルドコマンドを実行し、チェックアウトを Herdr 管理のプラグインデータの下に保存して
 登録します。非対話的なインストールには `--yes` を使ってください。GitHub 管理の
 プラグインを再インストールすると、その管理チェックアウトが置き換えられます。
+インストール済みおよびリンク済みのプラグインと、その有効・無効の状態は現在の
+ユーザー全体で共有され、すべての Herdr セッションから利用できます。Herdr サーバーが
+動作していないときでも `plugin install` と `plugin link` で登録できます。
+Herdr 0.7.3 の名前付きセッションだけにインストールしたプラグインは、再度 install
+または link してください。既存のプラグイン設定と状態はそのまま残ります。
 ローカルにリンクされたプラグインへの上書きインストールは拒否されます。先に
 ローカルプラグインを unlink または uninstall してください。`plugin install` と
 `plugin link` はプラグインの設定・状態ディレクトリを作成し、
@@ -226,6 +234,23 @@ Herdr のソケット環境変数は受け取りません。プラグインの�
 `bun`、`lua` といった必要なシステムツールをドキュメントに書いてください。Herdr は
 ビルドの失敗を報告しますが、足りないツールチェーンをインストールすることはありません。
 
+## スタートアップフック
+
+`[[startup]]` コマンドは、Herdr がセッションを復元し、API ソケットの準備が整った後に、
+有効なプラグインごとに一度実行されます。ライブハンドオフで新しいサーバーが引き継いだ
+ときにも再実行されますが、クライアントの接続、設定の再読み込み、プラグインの link や
+enable では実行されません。Herdr はこれらを非同期で開始し、完了を通常のプラグイン
+コマンドログに記録します。スタートアップの失敗でサーバーが停止することはありません。
+
+スタートアップフックは一度限りの初期化コマンドであり、監視されるデーモンではありません。
+フックはプラグインが所有する状態を復元し、必要な Herdr API を呼び出して終了してください。
+たとえば宣言型の Agent ビューを `HERDR_PLUGIN_STATE_DIR` に保存し、スタートアップフックで
+読み込んで再適用できます。
+
+スタートアップフックは通常のランタイムプラグイン環境と
+`HERDR_PLUGIN_EVENT=startup` を受け取ります。インストールプレビューには、自動実行される
+コードを確認できるよう、すべてのスタートアップコマンドが表示されます。
+
 ## コマンドと環境
 
 ランタイムコマンドは、プラグインディレクトリを作業ディレクトリとして実行されます。
@@ -233,8 +258,9 @@ Herdr は `HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`、`HERDR_ENV=1`、
 `HERDR_PLUGIN_ID`、`HERDR_PLUGIN_ROOT`、`HERDR_PLUGIN_CONFIG_DIR`、
 `HERDR_PLUGIN_STATE_DIR`、`HERDR_PLUGIN_CONTEXT_JSON`、そして利用可能なら
 `HERDR_WORKSPACE_ID`、`HERDR_TAB_ID`、`HERDR_PANE_ID` を注入します。アクション
-コマンドは加えて `HERDR_PLUGIN_ACTION_ID` を受け取ります。イベントフックは
-`HERDR_PLUGIN_EVENT` と `HERDR_PLUGIN_EVENT_JSON` を、ペインコマンドは
+コマンドは加えて `HERDR_PLUGIN_ACTION_ID` を受け取ります。スタートアップフックと
+イベントフックは `HERDR_PLUGIN_EVENT`（スタートアップフックでは `startup`）を受け取り、
+イベントフックはさらに `HERDR_PLUGIN_EVENT_JSON` を、ペインコマンドは
 `HERDR_PLUGIN_ENTRYPOINT_ID` を受け取ります。
 
 `HERDR_PLUGIN_ROOT` は、インストールまたはリンクされたプラグインディレクトリです。
@@ -332,10 +358,13 @@ v1 には Herdr が管理するプラグインストレージ API はありま�
 ## マーケットプレイス
 
 コミュニティ製プラグインは[マーケットプレイス](/plugins/)で探せます。これは
-GitHub トピック `herdr-plugin` が付いた公開 GitHub リポジトリの自動インデックスです。
-プラグインは普通の GitHub リポジトリのままです: `herdr-plugin.toml` を含めて公開し、
+GitHub トピック `herdr-plugin` が付いており、必須メタデータを解析できる
+`herdr-plugin.toml` が 1 つ以上ある公開 GitHub リポジトリの自動インデックスです。
+プラグインは普通の GitHub リポジトリのままです: 公開して
 `herdr plugin install owner/repo[/subdir]` を共有してください。
 
-プラグインを掲載するには、公開リポジトリに GitHub トピック `herdr-plugin` を
-追加します。インデックスは 30 分ごとに更新されます。発見の仕組みは
+プラグインを掲載するには、公開リポジトリに GitHub トピック `herdr-plugin` を追加し、
+デフォルトブランチのルートまたはサブディレクトリにマニフェストを置きます。
+1 つのリポジトリカードに複数のプラグインを掲載できます。インデックスは 30 分ごとに
+更新されます。発見の仕組みは
 [マーケットプレイス](/ja/docs/marketplace/)を参照してください。

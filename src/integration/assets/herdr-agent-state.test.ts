@@ -1,9 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
 import { rm } from "node:fs/promises";
-import { createServer, type Server } from "node:net";
+import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+const originalPlatform = process.platform;
+const originalCreateConnection = net.createConnection;
 const originalEnvironment = {
   HERDR_ENV: process.env.HERDR_ENV,
   HERDR_OMP_IDLE_DEBOUNCE_MS: process.env.HERDR_OMP_IDLE_DEBOUNCE_MS,
@@ -30,6 +32,8 @@ afterEach(async () => {
     socketPath = undefined;
   }
 
+  Object.defineProperty(process, "platform", { value: originalPlatform });
+  net.createConnection = originalCreateConnection;
   for (const [name, value] of Object.entries(originalEnvironment)) {
     if (value === undefined) {
       delete process.env[name];
@@ -44,6 +48,15 @@ const integrations = [
   { name: "Oh My Pi", modulePath: "./omp/herdr-agent-state.ts" },
 ] as const;
 
+const socketPlugins = [
+  {
+    name: "OpenCode",
+    modulePath: "./opencode/herdr-agent-state.js",
+    sessionID: "opencode-session",
+  },
+  { name: "Kilo", modulePath: "./kilo/herdr-agent-state.js", sessionID: "kilo-session" },
+] as const;
+
 function importFresh(modulePath: string) {
   importCounter += 1;
   return import(`${modulePath}?test=${importCounter}`);
@@ -53,14 +66,17 @@ type Handler = (event: unknown, context: unknown) => unknown;
 
 function createExtensionHarness() {
   const handlers = new Map<string, Handler>();
+  const eventHandlers = new Map<string, Handler>();
   return {
     handlers,
+    eventHandlers,
     pi: {
       on(event: string, handler: Handler) {
         handlers.set(event, handler);
       },
       events: {
-        on() {
+        on(event: string, handler: Handler) {
+          eventHandlers.set(event, handler);
           return () => {};
         },
       },
@@ -72,6 +88,15 @@ function configureIntegrationEnvironment(recordingSocketPath: string) {
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = recordingSocketPath;
   process.env.HERDR_PANE_ID = "test:p1";
+}
+
+function captureConnectionEndpoint() {
+  let connectedEndpoint: unknown;
+  net.createConnection = ((...args: unknown[]) => {
+    connectedEndpoint = args[0];
+    return Reflect.apply(originalCreateConnection, net, args);
+  }) as typeof net.createConnection;
+  return () => connectedEndpoint;
 }
 
 async function startRecordingServer(name: string): Promise<unknown[]> {
@@ -102,7 +127,62 @@ async function startRecordingServer(name: string): Promise<unknown[]> {
   return requests;
 }
 
+for (const socketPlugin of socketPlugins) {
+  test(`${socketPlugin.name} maps the Windows socket marker path to a named pipe endpoint`, async () => {
+    const markerPath = `herdr-${socketPlugin.name.toLowerCase()}-${process.pid}.sock`;
+    configureIntegrationEnvironment(markerPath);
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const connectedEndpoint = captureConnectionEndpoint();
+
+    const { HerdrAgentStatePlugin } = await importFresh(socketPlugin.modulePath);
+    const plugin = await HerdrAgentStatePlugin();
+    await plugin.event({
+      event: {
+        type: "session.updated",
+        properties: { sessionID: socketPlugin.sessionID },
+      },
+    });
+
+    expect(connectedEndpoint()).toBe(`\\\\.\\pipe\\${markerPath}`);
+  });
+}
+
+test("OpenCode stays disabled without the Herdr socket environment", async () => {
+  process.env.HERDR_ENV = "1";
+  process.env.HERDR_PANE_ID = "test:p1";
+  delete process.env.HERDR_SOCKET_PATH;
+
+  const { HerdrAgentStatePlugin } = await importFresh("./opencode/herdr-agent-state.js");
+
+  expect(await HerdrAgentStatePlugin()).toEqual({});
+});
+
 for (const integration of integrations) {
+  test(`${integration.name} maps the Windows socket marker path to a named pipe endpoint`, async () => {
+    const markerPath = `herdr-${integration.name.toLowerCase().replaceAll(" ", "-")}-${process.pid}.sock`;
+    configureIntegrationEnvironment(markerPath);
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const connectedEndpoint = captureConnectionEndpoint();
+    const { handlers, pi } = createExtensionHarness();
+
+    const { default: install } = await importFresh(integration.modulePath);
+    install(pi);
+    await handlers.get("session_start")?.(
+      { reason: "startup" },
+      {
+        hasUI: true,
+        mode: "tui",
+        isIdle: () => true,
+        sessionManager: {
+          getSessionFile: () => undefined,
+          getSessionId: () => "test-session",
+        },
+      },
+    );
+
+    expect(connectedEndpoint()).toBe(`\\\\.\\pipe\\${markerPath}`);
+  });
+
   test(`${integration.name} reload preserves working state when the agent is active`, async () => {
     const requests = await startRecordingServer(
       integration.name.toLowerCase().replaceAll(" ", "-"),
@@ -118,6 +198,7 @@ for (const integration of integrations) {
       { reason: "reload" },
       {
         hasUI: true,
+        mode: "tui",
         isIdle: () => false,
         sessionManager: {
           getSessionFile: () => undefined,
@@ -148,6 +229,92 @@ for (const integration of integrations) {
   });
 }
 
+test("OMP accepts POSIX and Windows session paths", async () => {
+  const { isAbsoluteSessionPath } = await importFresh("./omp/herdr-agent-state.ts");
+
+  expect(isAbsoluteSessionPath("/tmp/omp-session.jsonl")).toBe(true);
+  expect(isAbsoluteSessionPath("C:\\Users\\User\\.omp\\agent\\sessions\\omp-session.jsonl")).toBe(
+    true,
+  );
+  expect(isAbsoluteSessionPath("C:/Users/User/.omp/agent/sessions/omp-session.jsonl")).toBe(true);
+  expect(isAbsoluteSessionPath("relative/omp-session.jsonl")).toBe(false);
+});
+
+test("Pi reports idle only after the agent settles", async () => {
+  const requests = await startRecordingServer("pi-settled");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  expect(completionHandlers(handlers)).toEqual(["agent_settled"]);
+  let idle = true;
+  const context = piContext(() => idle);
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 2);
+  expect(requestStates(requests)).toEqual(["idle", "working"]);
+  expect(handlers.has("agent_end")).toBe(false);
+
+  const requestCountBeforeStaleSettlement = requests.length;
+  handlers.get("agent_settled")?.({}, context);
+  await Bun.sleep(25);
+  expect(requests).toHaveLength(requestCountBeforeStaleSettlement);
+  expect(requestStates(requests)).toEqual(["idle", "working"]);
+
+  idle = true;
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 3);
+  expect(requestStates(requests)).toEqual(["idle", "working", "idle"]);
+});
+
+test("Pi ignores RPC sessions even when UI APIs are available", async () => {
+  const requests = await startRecordingServer("pi-rpc");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  const context = {
+    ...piContext(() => true),
+    hasUI: true,
+    mode: "rpc",
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  handlers.get("agent_start")?.({}, context);
+  handlers.get("agent_settled")?.({}, context);
+  await Bun.sleep(25);
+
+  expect(requests).toEqual([]);
+});
+
+test("Pi settlement preserves explicit blocked-state precedence", async () => {
+  const requests = await startRecordingServer("pi-settled-blocked");
+  const { eventHandlers, handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = true;
+  const context = piContext(() => idle);
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 2);
+  eventHandlers.get("herdr:blocked")?.({ active: true, label: "approval" }, context);
+  await waitFor(() => requestStates(requests).length === 3);
+
+  idle = true;
+  handlers.get("agent_settled")?.({}, context);
+  await Bun.sleep(25);
+  expect(requestStates(requests)).toEqual(["idle", "working", "blocked"]);
+
+  eventHandlers.get("herdr:blocked")?.({ active: false }, context);
+  await waitFor(() => requestStates(requests).length === 4);
+  expect(requestStates(requests)).toEqual(["idle", "working", "blocked", "idle"]);
+});
+
 test("Pi reports the session replacement source", async () => {
   const requests = await startRecordingServer("pi-session-source");
   const { handlers, pi } = createExtensionHarness();
@@ -161,6 +328,7 @@ test("Pi reports the session replacement source", async () => {
     { reason: "new" },
     {
       hasUI: true,
+      mode: "tui",
       isIdle: () => true,
       sessionManager: {
         getSessionFile: () => "/tmp/pi-new.jsonl",
@@ -224,6 +392,7 @@ test("Pi waits for a replacement session report before publishing state", async 
     { reason: "new" },
     {
       hasUI: true,
+      mode: "tui",
       isIdle: () => false,
       sessionManager: {
         getSessionFile: () => "/tmp/pi-new.jsonl",
@@ -343,6 +512,7 @@ test("Pi retries working state after an unanswered socket attempt", async () => 
     { reason: "startup" },
     {
       hasUI: true,
+      mode: "tui",
       isIdle: () => false,
       sessionManager: {
         getSessionFile: () => undefined,
@@ -370,6 +540,36 @@ test("Pi retries working state after an unanswered socket attempt", async () => 
   expect(attemptedRequests[1]).toEqual(attemptedRequests[0]);
   expect(reportedWorking()).toBe(true);
 });
+
+function completionHandlers(handlers: Map<string, Handler>): string[] {
+  return ["agent_end", "agent_settled"].filter((event) => handlers.has(event));
+}
+
+function piContext(isIdle: () => boolean) {
+  return {
+    hasUI: true,
+    mode: "tui",
+    isIdle,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => undefined,
+    },
+  };
+}
+
+function requestStates(requests: unknown[]): unknown[] {
+  return requests
+    .filter((request) => isRecord(request) && request.method === "pane.report_agent")
+    .map(requestState);
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !predicate()) {
+    await Bun.sleep(5);
+  }
+  expect(predicate()).toBe(true);
+}
 
 function requestState(request: unknown): unknown {
   if (!isRecord(request) || !isRecord(request.params)) {

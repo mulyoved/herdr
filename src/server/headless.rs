@@ -14,7 +14,7 @@
 //! - Handles stale socket cleanup, explicit server stop, minimum terminal size,
 //!   and pane spawn failure during restore
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +44,6 @@ use crate::ipc::{
 };
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE,
 };
 #[cfg(unix)]
 use crate::server::client_accept::{
@@ -66,8 +65,7 @@ use crate::server::terminal_attach::paste_payload_for_runtime;
 
 mod pane_graphics;
 
-#[cfg(test)]
-use pane_graphics::frame_pane_graphics_for_client;
+use crate::protocol::MAX_GRAPHICS_FRAME_SIZE;
 use pane_graphics::RetainedGraphicsOutcome;
 
 #[cfg(test)]
@@ -142,6 +140,42 @@ enum RenderImpact {
 impl RenderImpact {
     fn merge(&mut self, other: Self) {
         *self = (*self).max(other);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtyRenderState {
+    Clean,
+    Hidden,
+    Visible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetainedRenderInput {
+    needs_full_render: bool,
+    needs_graphics_render: bool,
+    pty: PtyRenderState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedRenderPlan {
+    Full,
+    Graphics,
+    Pty,
+    HiddenPty,
+}
+
+fn retained_render_plan(input: RetainedRenderInput) -> RetainedRenderPlan {
+    if input.needs_full_render {
+        RetainedRenderPlan::Full
+    } else if input.needs_graphics_render && input.pty != PtyRenderState::Visible {
+        RetainedRenderPlan::Graphics
+    } else {
+        match input.pty {
+            PtyRenderState::Visible => RetainedRenderPlan::Pty,
+            PtyRenderState::Hidden => RetainedRenderPlan::HiddenPty,
+            PtyRenderState::Clean => RetainedRenderPlan::Full,
+        }
     }
 }
 
@@ -239,6 +273,19 @@ const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 // Headless server
 // ---------------------------------------------------------------------------
 
+struct AltScreenReadSpec {
+    terminal_id: crate::terminal::TerminalId,
+    lines: usize,
+    unwrap: bool,
+    initial: crate::terminal::ScreenSnapshot,
+}
+
+enum AltScreenReadConflict {
+    None,
+    Frozen(crate::pane::TerminalReadSnapshot),
+    Defer,
+}
+
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
@@ -256,6 +303,14 @@ pub struct HeadlessServer {
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
     foreground_client_id: Option<u64>,
+    /// Outer window title last pushed, paired with the client that received it.
+    /// Keying on the client means a newly attached terminal is written to even
+    /// when the title itself has not changed, without every code path that
+    /// changes the foreground client having to remember to invalidate this.
+    sent_window_title: Option<(u64, Option<String>)>,
+    /// Window title set through `client.window_title.set`. While present it wins
+    /// over the configured `ui.window_title` until the API clears it again.
+    api_window_title: Option<String>,
     /// Server-owned keybindings, restored when foreground clients use server mode.
     server_keybindings: crate::config::LiveKeybindConfig,
     /// Full server config warning shown to clients that use server keybindings.
@@ -264,6 +319,10 @@ pub struct HeadlessServer {
     server_config_diagnostic_without_keybindings: Option<String>,
     /// Writable direct attach owner per terminal id string.
     terminal_attach_owners: HashMap<String, u64>,
+    /// Deferred application-history reads currently driving alternate-screen viewports.
+    pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
+    /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
+    deferred_alt_screen_reads: Vec<api::ApiRequestMessage>,
     /// Monotonic activity counter used to pick the most recently active client.
     next_activity_stamp: u64,
     /// Shared pane runtime size derived from the foreground client,
@@ -314,12 +373,13 @@ fn apply_terminal_attach_scroll(
     match runtime.wheel_routing() {
         Some(crate::pane::WheelRouting::MouseReport) => {
             runtime.scroll_reset();
-            let column = column.unwrap_or(0);
-            let row = row.unwrap_or(0);
+            let position = crate::input::mouse::Position::Cell {
+                column: column.unwrap_or(0),
+                row: row.unwrap_or(0),
+            };
             let Some(bytes) = runtime.encode_mouse_wheel(
                 wheel_kind,
-                column,
-                row,
+                position,
                 KeyModifiers::from_bits_truncate(modifiers),
             ) else {
                 return Err(format!(
@@ -414,6 +474,7 @@ impl HeadlessServer {
         config_diagnostics: &[String],
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
+        should_quit: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
@@ -426,8 +487,6 @@ impl HeadlessServer {
         // Set non-blocking on Unix so we can poll it from the event loop.
         #[cfg(unix)]
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
-
-        let should_quit = Arc::new(AtomicBool::new(false));
 
         // Channel for server events from client threads.
         let (server_event_tx, server_event_rx) = mpsc::channel(64);
@@ -452,10 +511,14 @@ impl HeadlessServer {
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
+            sent_window_title: None,
+            api_window_title: None,
             server_keybindings,
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
+            pending_alt_screen_reads: Vec::new(),
+            deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
@@ -476,7 +539,7 @@ impl HeadlessServer {
     /// - Drains API requests (from the JSON socket)
     /// - Accepts new client connections
     /// - Reads client messages and routes input
-    /// - Handles scheduled tasks (resize poll, animation, session save, etc.)
+    /// - Handles scheduled tasks (session save, metadata expiry, etc.)
     /// - Renders virtually and streams frames to clients
     pub async fn run(&mut self) -> io::Result<()> {
         crate::logging::startup("server");
@@ -501,28 +564,24 @@ impl HeadlessServer {
 
             // If shutdown has been initiated, complete it and exit.
             if self.shutting_down {
-                self.complete_shutdown()?;
+                self.complete_shutdown().await?;
                 break;
             }
 
             // Check if we should start shutting down.
             if self.app.state.should_quit || self.should_quit.load(Ordering::Acquire) {
+                self.drain_internal_events_with_forwarding_up_to(
+                    crate::app::APP_EVENT_CHANNEL_CAPACITY,
+                );
                 self.initiate_shutdown();
                 continue;
             }
 
-            // 1. Check render_dirty flag from PTY reader tasks.
-            if self.app.render_dirty.load(Ordering::Acquire) {
+            // 1. Check the coalesced render signal from PTY readers and generic runtime work.
+            if self.app.render_dirty.is_pending() {
                 needs_render = true;
-                crate::render_prof::event("render.request.pty_dirty");
+                crate::render_prof::event("render.request.signal");
             }
-            let terminal_title_changed = self.app.sync_terminal_titles();
-            if terminal_title_changed && self.app.terminal_title_sidebar_configured() {
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.terminal_title");
-            }
-
             // 2. Drain a bounded internal-event batch. API handlers perform an
             // exhaustive forwarding-aware drain before reading pane/runtime state.
             if self.drain_internal_events_with_forwarding() {
@@ -530,6 +589,9 @@ impl HeadlessServer {
                 needs_full_render = true;
                 needs_graphics_render = false;
                 crate::render_prof::event("full_render_cause.internal_events");
+            }
+            if self.should_quit.load(Ordering::Acquire) {
+                continue;
             }
             if self.app.expire_due_metadata(Instant::now()) {
                 needs_render = true;
@@ -557,6 +619,9 @@ impl HeadlessServer {
                 needs_render = true;
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.api_requests");
+            }
+            if self.should_quit.load(Ordering::Acquire) {
+                continue;
             }
 
             self.app.sync_focus_events();
@@ -586,6 +651,9 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.server_events");
             }
+            if self.should_quit.load(Ordering::Acquire) {
+                continue;
+            }
 
             // 6. Handle scheduled tasks.
             let now = Instant::now();
@@ -602,6 +670,13 @@ impl HeadlessServer {
                 needs_graphics_render = false;
             }
 
+            self.poll_pending_alt_screen_reads(now);
+            if self.process_deferred_alt_screen_reads() {
+                needs_render = true;
+                needs_full_render = true;
+                needs_graphics_render = false;
+            }
+
             if latest_app_client(&self.clients).is_some() && self.app.ensure_default_workspace() {
                 needs_render = true;
                 needs_full_render = true;
@@ -609,38 +684,86 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.default_workspace");
             }
 
-            self.cancel_inactive_pane_graphics_streams();
+            if self.app.pane_graphics.retain_live_panes(&self.app.state) {
+                needs_render = true;
+                needs_graphics_render = true;
+            }
+            if self.expire_direct_graphics(now) {
+                needs_render = true;
+                needs_graphics_render = true;
+            }
 
             self.drain_client_config_reload_request();
             self.stream_host_mouse_capture_mode();
-
-            self.app.sync_headless_animation_timer(now);
+            self.stream_host_keyboard_enhancement_flags();
 
             // 7. Render virtually and stream frames.
             if needs_render && self.app.can_render_now(now) {
                 crate::render_prof::event("render.attempt");
-                let pty_dirty = self.app.render_dirty.swap(false, Ordering::AcqRel);
+                let render_request = self.app.render_dirty.take();
+                let pty_dirty = !render_request.pty_sources.is_empty();
                 if pty_dirty {
                     crate::render_prof::event("render.attempt.pty_dirty");
+                    crate::render_prof::counter(
+                        "render.attempt.pty_sources",
+                        render_request.pty_sources.len() as u64,
+                    );
+                }
+                if render_request.generic {
+                    needs_full_render = true;
+                    crate::render_prof::event("full_render_cause.generic_dirty");
+                }
+                let (sidebar_title_changed, outer_title_synced) =
+                    self.sync_terminal_title_sources(&render_request.terminal_title_sources);
+                if sidebar_title_changed {
+                    needs_full_render = true;
+                    crate::render_prof::event("full_render_cause.terminal_title_sidebar");
+                }
+                if needs_full_render && !outer_title_synced {
+                    self.sync_window_title();
+                }
+                if !needs_full_render && !needs_graphics_render && !pty_dirty {
+                    // A synchronized-output OSC title can be the only pending work.
+                    // Its deferred PTY repaint has its own signal; do not manufacture
+                    // a full UI render for this client-local side effect.
+                    needs_render = false;
+                    continue;
                 }
                 if needs_full_render {
                     crate::render_prof::event("retained_gate.needs_full_render");
                 } else if !pty_dirty {
                     crate::render_prof::event("retained_gate.not_pty_dirty");
                 }
-                let mut deferred_graphics = false;
-                let rendered_retained = if needs_graphics_render && !needs_full_render && !pty_dirty
+                let pty = if !pty_dirty {
+                    PtyRenderState::Clean
+                } else if self.pty_sources_visible_to_any_render_target(&render_request.pty_sources)
                 {
-                    match self.render_retained_graphics_update_and_stream() {
-                        RetainedGraphicsOutcome::Sent => true,
-                        RetainedGraphicsOutcome::Deferred => {
-                            deferred_graphics = true;
-                            false
-                        }
-                        RetainedGraphicsOutcome::Fallback => false,
-                    }
+                    PtyRenderState::Visible
                 } else {
-                    pty_dirty && !needs_full_render && self.render_retained_pty_update_and_stream()
+                    PtyRenderState::Hidden
+                };
+                let mut deferred_graphics = false;
+                let rendered_retained = match retained_render_plan(RetainedRenderInput {
+                    needs_full_render,
+                    needs_graphics_render,
+                    pty,
+                }) {
+                    RetainedRenderPlan::Full => false,
+                    RetainedRenderPlan::Graphics => {
+                        match self.render_retained_graphics_update_and_stream() {
+                            RetainedGraphicsOutcome::Sent => true,
+                            RetainedGraphicsOutcome::Deferred => {
+                                deferred_graphics = true;
+                                false
+                            }
+                            RetainedGraphicsOutcome::Fallback => false,
+                        }
+                    }
+                    RetainedRenderPlan::Pty => self.render_retained_pty_update_and_stream(),
+                    RetainedRenderPlan::HiddenPty => {
+                        crate::render_prof::event("render.skipped.hidden_sources");
+                        true
+                    }
                 };
                 if deferred_graphics {
                     needs_render = false;
@@ -667,6 +790,13 @@ impl HeadlessServer {
                 )
                 .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
                 .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
+            let next_deadline = self
+                .pending_alt_screen_reads
+                .iter()
+                .map(|pending| pending.next_deadline())
+                .fold(next_deadline, |deadline, pending| {
+                    Some(deadline.map_or(pending, |current| current.min(pending)))
+                });
             let event = {
                 tokio::select! {
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
@@ -685,6 +815,25 @@ impl HeadlessServer {
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
+
+            if self.should_quit.load(Ordering::Acquire) {
+                match event {
+                    LoopEvent::Internal(ev) => {
+                        self.handle_internal_event_with_forwarding(ev);
+                    }
+                    LoopEvent::ServerEvent(ServerEvent::ClientConnected { writer, .. }) => {
+                        if let Ok(message) =
+                            Self::frame_server_message(&ServerMessage::ServerShutdown {
+                                reason: Some("server is shutting down".to_owned()),
+                            })
+                        {
+                            let _ = writer.control.send(message);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
 
             match event {
                 LoopEvent::Timer => {}
@@ -738,7 +887,7 @@ impl HeadlessServer {
                     }
                 }
                 LoopEvent::RenderRequested => {
-                    if self.app.render_dirty.load(Ordering::Acquire) {
+                    if self.app.render_dirty.is_pending() {
                         needs_render = true;
                     }
                 }
@@ -908,6 +1057,7 @@ impl HeadlessServer {
                 },
                 respond_to,
                 response_write_complete: None,
+                stream_active: None,
             },
             true,
         );
@@ -970,7 +1120,7 @@ impl HeadlessServer {
         // rendering semantics. Force one fresh frame to every remaining client
         // even if the next rendered buffer compares equal to its cached frame.
         for client in self.clients.values_mut() {
-            client.request_full_redraw();
+            client.request_repaint();
         }
         if !start_pending_agent_resumes {
             self.app.pending_agent_resume_deadline = None;
@@ -983,12 +1133,21 @@ impl HeadlessServer {
             .start_pending_agent_resumes(self.app.pending_agent_resume_due(now))
         {
             for client in self.clients.values_mut() {
-                client.request_full_redraw();
+                client.request_repaint();
             }
         }
     }
 
     fn sync_foreground_client_state(&mut self) {
+        self.app.direct_graphics_available = self.direct_graphics_available();
+        self.app.pixel_mouse_available = self.foreground_client_id.is_some_and(|id| {
+            self.clients
+                .get(&id)
+                .is_some_and(|client| client.pixel_mouse)
+        });
+        if !self.app.direct_graphics_available {
+            self.retire_all_direct_graphics();
+        }
         let Some(client_id) = self.foreground_client_id else {
             self.effective_size = (MIN_COLS, MIN_ROWS);
             self.app.state.outer_terminal_focus = None;
@@ -1138,6 +1297,7 @@ impl HeadlessServer {
             panes,
             params.expected_protocol,
             params.expected_version,
+            self.api_window_title.clone(),
         );
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
@@ -1284,7 +1444,11 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        let api_server = api::start_server(api_tx, self.app.event_hub.clone())?;
+        let api_server = api::start_server_with_stop_control(
+            api_tx,
+            self.app.event_hub.clone(),
+            self.should_quit.clone(),
+        )?;
 
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
@@ -1391,12 +1555,23 @@ impl HeadlessServer {
             .count()
     }
 
+    fn direct_graphics_available(&self) -> bool {
+        self.app_client_count() == 1
+            && self.foreground_client_id.is_some_and(|id| {
+                self.clients.get(&id).is_some_and(|client| {
+                    client.is_full_app_client() && client.writer.is_some() && client.direct_graphics
+                })
+            })
+    }
+
     fn has_app_client(&self) -> bool {
         self.app_client_count() > 0
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.retire_direct_graphics_for_client(client_id);
         let was_foreground = self.foreground_client_id == Some(client_id);
+        self.app.clear_input_source(client_id);
         self.send_client_graphics_cleanup(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
@@ -1456,7 +1631,7 @@ impl HeadlessServer {
         let Ok(serialized) = Self::frame_server_message(&ServerMessage::Graphics { bytes }) else {
             return;
         };
-        let _ = writer.control.send(serialized);
+        writer.replace_with_cleanup(serialized);
     }
 
     fn send_all_clients_graphics_cleanup(&mut self) {
@@ -1536,7 +1711,10 @@ impl HeadlessServer {
     /// Uses the original full-render semantics when pane graphics are dormant.
     fn drain_server_events(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(ev) = self.server_event_rx.try_recv() {
+        while !self.should_quit.load(Ordering::Acquire) {
+            let Ok(ev) = self.server_event_rx.try_recv() else {
+                break;
+            };
             changed |= self.handle_server_event(ev);
         }
         changed
@@ -1545,10 +1723,26 @@ impl HeadlessServer {
     /// Returns the strongest render impact from the drained event batch.
     fn drain_server_events_with_render_impact(&mut self) -> RenderImpact {
         let mut impact = RenderImpact::None;
-        while let Ok(ev) = self.server_event_rx.try_recv() {
+        while !self.should_quit.load(Ordering::Acquire) {
+            let Ok(ev) = self.server_event_rx.try_recv() else {
+                break;
+            };
             impact.merge(self.handle_server_event_with_render_impact(ev));
         }
         impact
+    }
+
+    async fn reject_late_client_connections(&mut self) {
+        self.server_event_rx.close();
+        while let Some(event) = self.server_event_rx.recv().await {
+            if let ServerEvent::ClientConnected { writer, .. } = event {
+                if let Ok(message) = Self::frame_server_message(&ServerMessage::ServerShutdown {
+                    reason: Some("server is shutting down".to_owned()),
+                }) {
+                    let _ = writer.control.send(message);
+                }
+            }
+        }
     }
 
     fn terminal_id_by_string(&self, terminal_id: &str) -> Option<crate::terminal::TerminalId> {
@@ -1769,7 +1963,7 @@ impl HeadlessServer {
         let suppress_active_tab_notifications =
             self.active_tab_suppresses_notifications(is_active_tab);
 
-        if self.app.state.sound.allows(update.known_agent) {
+        if !update.suppress_completion && self.app.state.sound.allows(update.known_agent) {
             if let Some(sound) =
                 crate::app::actions::notification_sound_for_state_change_with_agent_labels(
                     suppress_active_tab_notifications,
@@ -1948,11 +2142,93 @@ impl HeadlessServer {
         .unwrap_or_else(|_| "{}".to_string())
     }
 
+    /// Pulls only titles reported dirty by the PTY parser. A focused pane title
+    /// is forwarded as an independent client side effect; only sidebar title
+    /// tokens require a UI render.
+    fn sync_terminal_title_sources(
+        &mut self,
+        sources: &HashSet<crate::layout::PaneId>,
+    ) -> (bool, bool) {
+        let focused_source = self
+            .app
+            .state
+            .active
+            .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
+            .and_then(|workspace| workspace.focused_pane_id())
+            .is_some_and(|pane_id| sources.contains(&pane_id));
+        let changes = self.app.sync_terminal_titles(sources);
+        let outer_title_synced = focused_source && self.app.window_title_uses_terminal_title();
+        if outer_title_synced {
+            self.sync_window_title();
+        }
+        (
+            self.app.terminal_title_sidebar_changed(&changes),
+            outer_title_synced,
+        )
+    }
+
+    /// Renders `ui.window_title` against current session state. `None` means
+    /// window titles are disabled or every token resolved empty, which leaves
+    /// the client on Herdr's default title.
+    fn configured_window_title(&self) -> Option<String> {
+        self.app
+            .window_title()
+            .and_then(|title| crate::config::sanitize_window_title_text(&title))
+    }
+
+    /// Pushes the configured outer window title to the foreground client when it
+    /// changed. Herdr consumes each pane's own `OSC 0`/`OSC 2`, so without this
+    /// the host terminal title never follows the session — which is what window
+    /// managers read for tab and group bar labels.
+    fn sync_window_title(&mut self) {
+        let title = match &self.api_window_title {
+            Some(title) => Some(title.clone()),
+            None if self.app.window_title_configured() => self.configured_window_title(),
+            None => return,
+        };
+        if let (Some(client_id), Some((sent_client_id, sent_title))) =
+            (self.foreground_client_id, self.sent_window_title.as_ref())
+        {
+            if *sent_client_id == client_id && *sent_title == title {
+                return;
+            }
+        }
+        self.send_window_title(title);
+    }
+
+    /// Sends a window title and remembers it only when a foreground client took
+    /// it, so the next client to attach is written to rather than skipped.
+    fn send_window_title(&mut self, title: Option<String>) -> bool {
+        let Some(client_id) = self.foreground_client_id else {
+            self.sent_window_title = None;
+            return false;
+        };
+        // A detached client keeps its entry with no writer, and a targeted send
+        // to one reports success without queuing anything. Caching the title
+        // against that client would skip the send once it attaches again.
+        if self
+            .clients
+            .get(&client_id)
+            .is_none_or(|client| client.writer.is_none())
+        {
+            self.sent_window_title = None;
+            return false;
+        }
+        let sent = self.send_to_client(
+            client_id,
+            ServerMessage::WindowTitle {
+                title: title.clone(),
+            },
+        );
+        self.sent_window_title = sent.then_some((client_id, title));
+        sent
+    }
+
     fn handle_client_window_title_api(&mut self, id: String, title: Option<String>) -> String {
         use api::schema::{ClientWindowTitleReason, ResponseResult};
 
         let title = match title {
-            Some(title) => match sanitize_window_title_text(&title, 200) {
+            Some(title) => match crate::config::sanitize_window_title_text(&title) {
                 Some(title) => Some(title),
                 None => {
                     return serde_json::to_string(&api::schema::ErrorResponse {
@@ -1968,7 +2244,11 @@ impl HeadlessServer {
             None => None,
         };
         let set_title = title.is_some();
-        let changed = self.send_to_foreground_client(ServerMessage::WindowTitle { title });
+        // An explicit title suppresses `ui.window_title` until it is cleared,
+        // and clearing restores the configured title rather than only "herdr".
+        self.api_window_title = title.clone();
+        let title = title.or_else(|| self.configured_window_title());
+        let changed = self.send_window_title(title);
         let reason = match (changed, set_title) {
             (true, true) => ClientWindowTitleReason::Set,
             (true, false) => ClientWindowTitleReason::Cleared,
@@ -2003,6 +2283,15 @@ impl HeadlessServer {
     /// Returns true if the event changed visual state (requiring a re-render).
     fn handle_internal_event_with_forwarding(&mut self, ev: AppEvent) -> bool {
         match &ev {
+            AppEvent::TerminalBell { pane_id, count } => {
+                if !self.send_to_foreground_client(ServerMessage::TerminalBell { count: *count }) {
+                    debug!(
+                        pane = pane_id.raw(),
+                        count, "dropped terminal bell without a foreground client"
+                    );
+                }
+                false
+            }
             AppEvent::ClipboardWrite { content } => {
                 // Clipboard writes are client-local side effects. Forward them only to
                 // the foreground client instead of broadcasting to every attached client.
@@ -2036,7 +2325,11 @@ impl HeadlessServer {
                 // Headless mode disables local sound playback separately from the
                 // sound policy so reloads can keep server-side notification policy live.
                 self.sync_foreground_client_state();
-                self.app.handle_internal_event(ev);
+                let suppress_completion = self
+                    .app
+                    .handle_internal_event_with_pane_updates(ev)
+                    .iter()
+                    .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
 
                 // Forward sound notification to clients when server-side sound policy allows it.
                 let is_active_tab = self
@@ -2055,7 +2348,8 @@ impl HeadlessServer {
                 let next_state = self.pane_effective_state(pane_id_val);
                 let next_agent_label = self.pane_effective_agent_label(pane_id_val);
 
-                if self.app.state.toast_config.delay_seconds == 0
+                if !suppress_completion
+                    && self.app.state.toast_config.delay_seconds == 0
                     && self.app.state.sound.allows(agent_val)
                 {
                     if let Some(sound) =
@@ -2075,7 +2369,8 @@ impl HeadlessServer {
                     }
                 }
 
-                let toast_msg = if self.app.state.toast_config.delay_seconds == 0
+                let toast_msg = if !suppress_completion
+                    && self.app.state.toast_config.delay_seconds == 0
                     && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
                 {
                     if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
@@ -2127,7 +2422,11 @@ impl HeadlessServer {
                 let prev_agent_label = self.pane_effective_agent_label(pane_id_val);
 
                 self.sync_foreground_client_state();
-                self.app.handle_internal_event(ev);
+                let suppress_completion = self
+                    .app
+                    .handle_internal_event_with_pane_updates(ev)
+                    .iter()
+                    .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
 
                 // Forward sound notification based on the effective transition when
                 // server-side sound policy allows it.
@@ -2147,7 +2446,8 @@ impl HeadlessServer {
                 let next_state = self.pane_effective_state(pane_id_val);
                 let next_agent_label = self.pane_effective_agent_label(pane_id_val);
 
-                if self.app.state.toast_config.delay_seconds == 0
+                if !suppress_completion
+                    && self.app.state.toast_config.delay_seconds == 0
                     && self.app.state.sound.allows(agent_val)
                 {
                     if let Some(sound) =
@@ -2167,7 +2467,8 @@ impl HeadlessServer {
                     }
                 }
 
-                let toast_msg = if self.app.state.toast_config.delay_seconds == 0
+                let toast_msg = if !suppress_completion
+                    && self.app.state.toast_config.delay_seconds == 0
                     && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
                 {
                     if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
@@ -2270,10 +2571,7 @@ impl HeadlessServer {
 
                 true
             }
-            _ => {
-                self.app.handle_internal_event(ev);
-                true
-            }
+            _ => self.app.handle_internal_event_with_render_impact(ev),
         }
     }
 
@@ -2304,7 +2602,7 @@ impl HeadlessServer {
             let (had_event, batch_changed) =
                 self.drain_internal_events_with_forwarding_up_to(crate::app::APP_EVENT_DRAIN_LIMIT);
             changed |= batch_changed;
-            if !had_event {
+            if !had_event || self.should_quit.load(Ordering::Acquire) {
                 break;
             }
         }
@@ -2504,6 +2802,23 @@ impl HeadlessServer {
             return false;
         };
 
+        if self
+            .pending_alt_screen_reads
+            .iter()
+            .any(|pending| pending.terminal_id == real_terminal_id)
+        {
+            self.send_to_client(
+                client_id,
+                ServerMessage::ServerShutdown {
+                    reason: Some(format!(
+                        "terminal attach failed: terminal {terminal_id} has a read in progress; retry"
+                    )),
+                },
+            );
+            self.remove_client_and_resize_if_needed(client_id);
+            return false;
+        }
+
         if let Some(existing_owner) = self.terminal_attach_owners.get(&terminal_id).copied() {
             if existing_owner != client_id && !takeover {
                 self.send_to_client(
@@ -2581,11 +2896,13 @@ impl HeadlessServer {
             &events,
             self.app.state.redraw_on_focus_gained,
         );
+        let render_neutral_mouse_motion =
+            events_are_render_neutral_mouse_motion(&events, self.app.state.mode);
         if let Some(client) = self.clients.get_mut(&client_id) {
             if host_surface_redraw {
-                client.request_full_redraw();
+                client.request_repaint();
                 client.defer_full_render();
-            } else {
+            } else if !render_neutral_mouse_motion {
                 // Ensure semantic clients receive one post-input frame even if the
                 // semantic buffer compares equal. Terminal-ANSI clients must keep their
                 // server-side blit baseline; resetting it here forces a full redraw on
@@ -2595,6 +2912,13 @@ impl HeadlessServer {
         }
         if source_is_full_app {
             self.update_client_outer_focus_from_events(client_id, &events);
+            if events
+                .iter()
+                .any(|event| matches!(event, crate::raw_input::RawInputEvent::OuterFocusLost))
+            {
+                // Focus loss is not a teardown, so the pending URL click stays.
+                self.app.release_input_source_headless(client_id);
+            }
         }
         let events = events_for_app_routing(events, source_was_foreground, source_is_full_app);
         let interaction = events_include_interaction(&events);
@@ -2607,8 +2931,9 @@ impl HeadlessServer {
             self.resize_shared_runtime_to_effective_size_before_input();
         }
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
-        self.app
-            .route_client_events(events, self.foreground_client_id == Some(client_id));
+        // Client-local theme reports were applied above; routing them again would update every
+        // pane once per palette entry instead of once per captured batch.
+        self.app.route_client_events_from(client_id, events, false);
         if self.app.take_config_reloaded_from_disk() {
             self.reload_server_config(false);
         } else {
@@ -2633,7 +2958,7 @@ impl HeadlessServer {
 
             false
         } else {
-            foreground_changed || theme_changed || interaction
+            foreground_changed || theme_changed || (interaction && !render_neutral_mouse_motion)
         }
     }
 
@@ -2653,6 +2978,7 @@ impl HeadlessServer {
                 writer,
                 render_encoding,
                 direct_attach_requested,
+                direct_graphics,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -2678,24 +3004,24 @@ impl HeadlessServer {
                     "client connected"
                 );
                 let last_activity = self.allocate_activity_stamp();
-                self.clients.insert(
-                    client_id,
-                    ClientConnection::new_with_mode(
-                        ClientConnectionMode::App,
-                        keybindings,
-                        (cols, rows),
-                        crate::kitty_graphics::HostCellSize {
-                            width_px: cell_width_px,
-                            height_px: cell_height_px,
-                        },
-                        crate::terminal_theme::TerminalTheme::default(),
-                        None,
-                        last_activity,
-                        render_encoding,
-                        direct_attach_requested,
-                        Some(writer),
-                    ),
+                let mut connection = ClientConnection::new_with_mode(
+                    ClientConnectionMode::App,
+                    keybindings,
+                    (cols, rows),
+                    crate::kitty_graphics::HostCellSize {
+                        width_px: cell_width_px,
+                        height_px: cell_height_px,
+                    },
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    last_activity,
+                    render_encoding,
+                    direct_attach_requested,
+                    Some(writer),
                 );
+                connection.direct_graphics = direct_graphics;
+                connection.pixel_mouse = direct_graphics;
+                self.clients.insert(client_id, connection);
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
                 }
@@ -2707,6 +3033,17 @@ impl HeadlessServer {
                 self.nudge_handoff_panes_on_first_client_attach();
                 true
             }
+            ServerEvent::GraphicsTransmissionResult {
+                client_id,
+                transfer_id,
+                image_id,
+                success,
+            } => self.complete_direct_graphics(client_id, transfer_id, image_id, success),
+            ServerEvent::GraphicsTransmissionStarted {
+                client_id,
+                transfer_id,
+                image_id,
+            } => self.start_direct_graphics_response(client_id, transfer_id, image_id),
             ServerEvent::ClientAttachTerminal {
                 client_id,
                 terminal_id,
@@ -2731,6 +3068,35 @@ impl HeadlessServer {
             } => self.handle_terminal_attach_scroll(
                 client_id, source, direction, lines, column, row, modifiers,
             ),
+            ServerEvent::ClientInputPixels {
+                client_id,
+                data,
+                geometry,
+            } => {
+                let coordinates_valid = crate::input::mouse::parse_report(&data)
+                    .and_then(|(x, y)| geometry.cell(x, y))
+                    .is_some();
+                let valid = coordinates_valid
+                    && self.clients.get(&client_id).is_some_and(|client| {
+                        let cell = client.cell_size;
+                        client.is_full_app_client()
+                            && client.host_sgr_pixels_active == Some(true)
+                            && client.terminal_size == (geometry.cols, geometry.rows)
+                            && cell.is_known()
+                            && cell.width_px == geometry.width_px / u32::from(geometry.cols)
+                            && cell.height_px == geometry.height_px / u32::from(geometry.rows)
+                    });
+                if !valid || self.handoff_in_progress || !self.focused_pane_graphics_demand() {
+                    return false;
+                }
+                let foreground_changed = self.promote_client_to_foreground(client_id);
+                if foreground_changed {
+                    self.resize_shared_runtime_to_effective_size_before_input();
+                }
+                self.app
+                    .route_client_pixel_mouse(client_id, &data, geometry)
+                    || foreground_changed
+            }
             ServerEvent::ClientInput { client_id, data } => {
                 if self.handoff_in_progress {
                     debug!(
@@ -2797,6 +3163,23 @@ impl HeadlessServer {
                     .collect();
                 self.handle_client_input_events(client_id, events)
             }
+            ServerEvent::ClientPasteRejected {
+                client_id,
+                size,
+                max,
+            } => {
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::Notify {
+                        kind: protocol::NotifyKind::Toast,
+                        message: "Paste rejected".to_owned(),
+                        body: Some(format!(
+                            "Input message is {size} bytes; Herdr's limit is {max} bytes"
+                        )),
+                    },
+                );
+                false
+            }
             ServerEvent::ClientClipboardImage {
                 client_id,
                 extension,
@@ -2842,18 +3225,21 @@ impl HeadlessServer {
                 }) = self.clients.get_mut(&client_id)
                 {
                     *terminal_size = (cols, rows);
-                    *cell_size = crate::kitty_graphics::HostCellSize {
+                    let observed = crate::kitty_graphics::HostCellSize {
                         width_px: cell_width_px,
                         height_px: cell_height_px,
                     };
-                    render_state.reset_baseline();
-                    Some(terminal_id.clone())
+                    if observed.is_known() {
+                        *cell_size = observed;
+                    }
+                    render_state.request_repaint();
+                    Some((terminal_id.clone(), *cell_size))
                 } else {
                     None
                 };
-                if let Some(terminal_id) = direct_terminal_id {
+                if let Some((terminal_id, cell_size)) = direct_terminal_id {
                     if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
-                        runtime.resize(rows, cols, cell_width_px, cell_height_px);
+                        runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
                     }
                     return true;
                 }
@@ -2866,19 +3252,25 @@ impl HeadlessServer {
                 }) = self.clients.get_mut(&client_id)
                 {
                     *terminal_size = (cols, rows);
-                    *cell_size = crate::kitty_graphics::HostCellSize {
+                    let observed = crate::kitty_graphics::HostCellSize {
                         width_px: cell_width_px,
                         height_px: cell_height_px,
                     };
-                    render_state.reset_baseline();
+                    if observed.is_known() {
+                        *cell_size = observed;
+                    }
+                    render_state.request_repaint();
                     return true;
                 }
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     client.terminal_size = (cols, rows);
-                    client.cell_size = crate::kitty_graphics::HostCellSize {
+                    let observed = crate::kitty_graphics::HostCellSize {
                         width_px: cell_width_px,
                         height_px: cell_height_px,
                     };
+                    if observed.is_known() {
+                        client.cell_size = observed;
+                    }
                 }
                 self.promote_client_to_foreground(client_id);
                 self.resize_shared_runtime_to_effective_size();
@@ -2910,19 +3302,10 @@ impl HeadlessServer {
     }
 
     fn handle_server_event_with_render_impact(&mut self, ev: ServerEvent) -> RenderImpact {
-        let deferred_render = match &ev {
-            ServerEvent::ClientWriterDrained { client_id } => self
-                .clients
-                .get(client_id)
-                .map_or(DeferredRender::None, ClientConnection::deferred_render),
-            _ => DeferredRender::None,
-        };
-        if !self.handle_server_event(ev) {
-            return RenderImpact::None;
-        }
-        match deferred_render {
-            DeferredRender::Graphics => RenderImpact::Graphics,
-            DeferredRender::None | DeferredRender::Full => RenderImpact::Full,
+        if self.handle_server_event(ev) {
+            RenderImpact::Full
+        } else {
+            RenderImpact::None
         }
     }
 
@@ -2936,20 +3319,217 @@ impl HeadlessServer {
         )
     }
 
+    fn agent_read_not_idle_error(
+        &self,
+        request: &api::schema::Request,
+    ) -> Option<api::schema::ErrorBody> {
+        use api::schema::{Method, ReadFormat, ReadSource};
+
+        let Method::AgentRead(params) = &request.method else {
+            return None;
+        };
+        let requested = params.lines?;
+        if params.format != ReadFormat::Text
+            || !matches!(
+                params.source,
+                ReadSource::Recent | ReadSource::RecentUnwrapped
+            )
+        {
+            return None;
+        }
+        let target = self.app.resolve_agent_target(&params.target).ok()?;
+        let terminal = self
+            .app
+            .state
+            .terminals
+            .values()
+            .find(|terminal| terminal.id.as_str() == target.terminal_id)?;
+        if terminal.effective_known_agent().is_none()
+            || terminal.state == crate::detect::AgentState::Idle
+        {
+            return None;
+        }
+        let runtime = self.app.terminal_runtimes.get(&terminal.id)?;
+        let (screen, snapshot) = runtime.screen_text_snapshot()?;
+        if screen != crate::ghostty::ActiveScreen::Alternate
+            || snapshot.rows.len() >= requested.min(1000) as usize
+        {
+            return None;
+        }
+        let status = crate::detect::manifest::agent_state_label(terminal.state);
+        Some(api::schema::ErrorBody {
+            code: "agent_not_idle".into(),
+            message: format!(
+                "cannot read {requested} lines while {} is {status}: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible",
+                params.target
+            ),
+        })
+    }
+
+    fn alt_screen_read_spec(&self, request: &api::schema::Request) -> Option<AltScreenReadSpec> {
+        use api::schema::{Method, ReadFormat, ReadIntent, ReadSource};
+
+        let (target, source, lines, format) = match &request.method {
+            Method::AgentRead(params) => (
+                self.app.resolve_agent_target(&params.target).ok()?,
+                params.source,
+                params.lines,
+                params.format,
+            ),
+            Method::PaneRead(params) if params.intent == ReadIntent::Interactive => (
+                self.app.resolve_terminal_target(&params.pane_id).ok()?,
+                params.source,
+                params.lines,
+                params.format,
+            ),
+            _ => return None,
+        };
+        if format != ReadFormat::Text
+            || !matches!(source, ReadSource::Recent | ReadSource::RecentUnwrapped)
+        {
+            return None;
+        }
+        let lines = lines.unwrap_or(80).min(1000) as usize;
+        if lines == 0
+            || self
+                .terminal_attach_owners
+                .contains_key(target.terminal_id.as_str())
+            || self
+                .pending_alt_screen_reads
+                .iter()
+                .any(|pending| pending.terminal_id.as_str() == target.terminal_id)
+        {
+            return None;
+        }
+        let terminal = self
+            .app
+            .state
+            .terminals
+            .values()
+            .find(|terminal| terminal.id.as_str() == target.terminal_id)?;
+        if terminal.effective_known_agent().is_none()
+            || terminal.state != crate::detect::AgentState::Idle
+        {
+            return None;
+        }
+        let runtime = self.app.terminal_runtimes.get(&terminal.id)?;
+        if runtime.wheel_routing() != Some(crate::pane::WheelRouting::MouseReport) {
+            return None;
+        }
+        let (screen, initial) = runtime.screen_text_snapshot()?;
+        if screen != crate::ghostty::ActiveScreen::Alternate || initial.rows.len() >= lines {
+            return None;
+        }
+        Some(AltScreenReadSpec {
+            terminal_id: terminal.id.clone(),
+            lines,
+            unwrap: source == ReadSource::RecentUnwrapped,
+            initial,
+        })
+    }
+
+    fn poll_pending_alt_screen_reads(&mut self, now: Instant) {
+        let pending = std::mem::take(&mut self.pending_alt_screen_reads);
+        for read in pending {
+            let runtime = self.app.terminal_runtimes.get(&read.terminal_id);
+            let remains_idle = self
+                .app
+                .state
+                .terminals
+                .get(&read.terminal_id)
+                .is_some_and(|terminal| terminal.state == crate::detect::AgentState::Idle);
+            let attached = self
+                .terminal_attach_owners
+                .contains_key(read.terminal_id.as_str());
+            let outcome = if remains_idle && !attached {
+                read.poll(runtime, now)
+            } else {
+                read.abort(runtime, now)
+            };
+            if let Some(read) = outcome {
+                self.pending_alt_screen_reads.push(read);
+            }
+        }
+    }
+
+    fn alt_screen_read_conflict(&self, request: &api::schema::Request) -> AltScreenReadConflict {
+        let (target, source, lines, format) = match &request.method {
+            api::schema::Method::AgentRead(params) => (
+                self.app.resolve_agent_target(&params.target).ok(),
+                params.source,
+                params.lines,
+                params.format,
+            ),
+            api::schema::Method::PaneRead(params) => (
+                self.app.resolve_terminal_target(&params.pane_id).ok(),
+                params.source,
+                params.lines,
+                params.format,
+            ),
+            _ => return AltScreenReadConflict::None,
+        };
+        let Some(target) = target else {
+            return AltScreenReadConflict::None;
+        };
+        let Some(pending) = self
+            .pending_alt_screen_reads
+            .iter()
+            .find(|pending| pending.terminal_id.as_str() == target.terminal_id)
+        else {
+            return AltScreenReadConflict::None;
+        };
+        if format == api::schema::ReadFormat::Text {
+            AltScreenReadConflict::Frozen(pending.frozen_snapshot(source, lines))
+        } else {
+            AltScreenReadConflict::Defer
+        }
+    }
+
+    fn process_deferred_alt_screen_reads(&mut self) -> bool {
+        let deferred = std::mem::take(&mut self.deferred_alt_screen_reads);
+        let mut changed = false;
+        for msg in deferred {
+            match self.alt_screen_read_conflict(&msg.request) {
+                AltScreenReadConflict::None => {
+                    changed |= self.handle_api_request_with_shutdown_check(msg);
+                }
+                AltScreenReadConflict::Frozen(_) | AltScreenReadConflict::Defer => {
+                    self.deferred_alt_screen_reads.push(msg);
+                }
+            }
+        }
+        changed
+    }
+
     /// Drains API requests with shutdown awareness.
     ///
     /// During shutdown, remaining requests get a `server_unavailable` error.
     fn drain_api_requests_with_shutdown_check(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(msg) = self.app.api_rx.try_recv() {
+        while !self.should_quit.load(Ordering::Acquire) {
+            let Ok(msg) = self.app.api_rx.try_recv() else {
+                break;
+            };
             changed |= self.handle_api_request_with_shutdown_check(msg);
         }
         changed
     }
 
+    fn reject_queued_api_requests_for_shutdown(&mut self) {
+        for _ in 0..self.app.api_rx.len() {
+            let Ok(msg) = self.app.api_rx.try_recv() else {
+                break;
+            };
+            self.handle_api_request_with_shutdown_check(msg);
+        }
+    }
+
     fn drain_api_requests_with_render_impact(&mut self) -> RenderImpact {
         let mut impact = RenderImpact::None;
-        while let Ok(msg) = self.app.api_rx.try_recv() {
+        while !self.should_quit.load(Ordering::Acquire) {
+            let Ok(msg) = self.app.api_rx.try_recv() else {
+                break;
+            };
             impact.merge(self.handle_api_request_with_render_impact(msg));
         }
         impact
@@ -2972,6 +3552,7 @@ impl HeadlessServer {
         if matches!(
             &msg.request.method,
             api::schema::Method::PaneGraphicsStreamSet(_)
+                | api::schema::Method::PaneGraphicsStreamDirect(_)
         ) {
             return self.handle_pane_graphics_stream_frame(msg);
         }
@@ -3004,7 +3585,21 @@ impl HeadlessServer {
             return false;
         }
 
+        let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {
+            AltScreenReadConflict::None => None,
+            AltScreenReadConflict::Frozen(snapshot) => Some(snapshot),
+            AltScreenReadConflict::Defer => {
+                self.deferred_alt_screen_reads.push(msg);
+                return false;
+            }
+        };
+
         let metadata_expired = self.app.expire_due_metadata(Instant::now());
+        let stream_open = match &msg.request.method {
+            api::schema::Method::PaneGraphicsStreamOpen(params) => Some(params.clone()),
+            _ => None,
+        };
+        let stream_active = msg.stream_active.clone();
 
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
             let handoff_result = self.perform_live_handoff(params.clone());
@@ -3062,7 +3657,7 @@ impl HeadlessServer {
                 | api::schema::Method::PaneGraphicsStreamOpen(_)
                 | api::schema::Method::PaneGraphicsStreamClose(_)
         )
-        .then_some(self.app.state.pane_graphics_revision);
+        .then_some(self.app.pane_graphics.revision());
         let mut changed = metadata_expired
             | (pane_graphics_revision_before.is_none() && api::request_changes_ui(&msg.request));
         let skip_default_workspace = skip_default_workspace_for_request
@@ -3108,6 +3703,16 @@ impl HeadlessServer {
         };
 
         self.sync_foreground_client_state();
+        if let Some(error) = self.agent_read_not_idle_error(&msg.request) {
+            let response = serde_json::to_string(&api::schema::ErrorResponse {
+                id: msg.request.id.clone(),
+                error,
+            })
+            .unwrap_or_else(|_| "{}".to_owned());
+            let _ = msg.respond_to.send(response);
+            return changed;
+        }
+        let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
         if matches!(
             &msg.request.method,
             api::schema::Method::WorktreeCreate(_) | api::schema::Method::WorktreeRemove(_)
@@ -3117,7 +3722,7 @@ impl HeadlessServer {
                 .handle_deferred_worktree_api_request(msg.request, msg.respond_to);
             return changed | deferred_changed;
         }
-        let response = if matches!(
+        let mut response = if matches!(
             &msg.request.method,
             api::schema::Method::ServerReloadConfig(_)
         ) {
@@ -3143,10 +3748,45 @@ impl HeadlessServer {
             self.app
                 .handle_api_request_after_internal_events_drained(msg.request)
         };
+        if let Some(snapshot) = frozen_alt_screen_read {
+            if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)
+            {
+                if let api::schema::ResponseResult::PaneRead { read } = &mut success.result {
+                    read.text = snapshot.text;
+                    read.truncated = snapshot.truncated;
+                    if let Ok(serialized) = serde_json::to_string(&success) {
+                        response = serialized;
+                    }
+                }
+            }
+        }
+        if let (Some(params), Some(active)) = (stream_open.as_ref(), stream_active) {
+            self.app
+                .attach_pane_graphics_stream_active(params, active, &response);
+        }
+        if let Some(spec) = alt_screen_read_spec {
+            if let Ok(success) = serde_json::from_str::<api::schema::SuccessResponse>(&response) {
+                if let api::schema::ResponseResult::PaneRead { read } = success.result {
+                    let pending = crate::server::alt_screen_read::PendingAltScreenRead::start(
+                        spec.terminal_id,
+                        success.id,
+                        msg.respond_to,
+                        response,
+                        read,
+                        spec.lines,
+                        spec.unwrap,
+                        spec.initial,
+                        Instant::now(),
+                    );
+                    self.pending_alt_screen_reads.push(pending);
+                    return changed;
+                }
+            }
+        }
         let _ = msg.respond_to.send(response);
 
         if let Some(revision_before) = pane_graphics_revision_before {
-            changed |= revision_before != self.app.state.pane_graphics_revision;
+            changed |= revision_before != self.app.pane_graphics.revision();
         }
 
         // Forward new toast state only when a client-local delivery mode is selected.
@@ -3294,32 +3934,73 @@ impl HeadlessServer {
         changed
     }
 
+    fn focused_pane_graphics_demand(&self) -> bool {
+        self.app
+            .state
+            .active
+            .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+            .is_some_and(|pane_id| self.app.pane_graphics.active_for_pane(pane_id))
+    }
+
     fn stream_host_mouse_capture_mode(&mut self) {
         let enabled = self
             .app
             .state
             .should_capture_host_mouse_from(&self.app.terminal_runtimes);
-        let serialized = match Self::frame_server_message(&ServerMessage::MouseCapture { enabled })
-        {
-            Ok(framed) => framed,
-            Err(err) => {
-                warn!(err = %err, "failed to serialize mouse capture mode for clients");
-                return;
-            }
-        };
-
+        let pixel_mouse_requested = self
+            .clients
+            .values()
+            .any(|client| client.is_full_app_client() && client.pixel_mouse);
+        let sgr_pixels = pixel_mouse_requested
+            && self.focused_pane_graphics_demand()
+            && self
+                .app
+                .state
+                .active
+                .and_then(|ws_idx| {
+                    self.app
+                        .state
+                        .workspaces
+                        .get(ws_idx)
+                        .and_then(crate::workspace::Workspace::focused_pane_id)
+                        .and_then(|pane_id| {
+                            self.app.state.runtime_for_pane_in_workspace(
+                                &self.app.terminal_runtimes,
+                                ws_idx,
+                                pane_id,
+                            )
+                        })
+                })
+                .and_then(crate::terminal::TerminalRuntime::input_state)
+                .is_some_and(|state| {
+                    state.mouse_protocol_encoding == crate::input::MouseProtocolEncoding::SgrPixels
+                });
         let mut broken_clients: Vec<u64> = Vec::new();
         for (&client_id, client) in &mut self.clients {
             if !client.is_full_app_client() {
                 continue;
             }
-            if client.host_mouse_capture_active == Some(enabled) {
+            let client_sgr_pixels = sgr_pixels && client.pixel_mouse;
+            if client.host_mouse_capture_active == Some(enabled)
+                && client.host_sgr_pixels_active == Some(client_sgr_pixels)
+            {
                 continue;
             }
             let Some(writer) = &client.writer else {
                 continue;
             };
-            if writer.control.send(serialized.clone()).is_err() {
+            let serialized = match Self::frame_server_message(&ServerMessage::MouseCapture {
+                enabled,
+                sgr_pixels: client_sgr_pixels,
+            }) {
+                Ok(framed) => framed,
+                Err(err) => {
+                    warn!(err = %err, "failed to serialize mouse capture mode for client");
+                    continue;
+                }
+            };
+            if writer.control.send(serialized).is_err() {
                 debug!(
                     client_id,
                     "client writer channel closed during mouse capture update"
@@ -3328,11 +4009,129 @@ impl HeadlessServer {
                 continue;
             }
             client.host_mouse_capture_active = Some(enabled);
+            client.host_sgr_pixels_active = Some(client_sgr_pixels);
         }
 
         for client_id in broken_clients {
             self.remove_client_and_resize_if_needed(client_id);
         }
+    }
+
+    fn stream_host_keyboard_enhancement_flags(&mut self) {
+        let report_all_keys = self.app.host_keyboard_report_all_requested();
+        let serialized = match Self::frame_server_message(&ServerMessage::KittyKeyboardReportAll {
+            enabled: report_all_keys,
+        }) {
+            Ok(framed) => framed,
+            Err(err) => {
+                warn!(err = %err, "failed to serialize keyboard enhancement flags for clients");
+                return;
+            }
+        };
+
+        let mut broken_clients = Vec::new();
+        for (&client_id, client) in &mut self.clients {
+            if !client.is_full_app_client()
+                || client.host_keyboard_report_all_active == Some(report_all_keys)
+            {
+                continue;
+            }
+            let Some(writer) = &client.writer else {
+                continue;
+            };
+            if writer.control.send(serialized.clone()).is_err() {
+                debug!(
+                    client_id,
+                    "client writer channel closed during keyboard enhancement update"
+                );
+                broken_clients.push(client_id);
+                continue;
+            }
+            client.host_keyboard_report_all_active = Some(report_all_keys);
+        }
+
+        for client_id in broken_clients {
+            self.remove_client_and_resize_if_needed(client_id);
+        }
+    }
+
+    fn pty_sources_visible_to_any_render_target(
+        &self,
+        sources: &HashSet<crate::layout::PaneId>,
+    ) -> bool {
+        let mut has_app_target = false;
+        let mut direct_terminal_targets = HashSet::new();
+        for client in self
+            .clients
+            .values()
+            .filter(|client| client.writer.is_some())
+        {
+            match &client.mode {
+                ClientConnectionMode::App if client.is_full_app_client() => {
+                    has_app_target = true;
+                }
+                ClientConnectionMode::TerminalAttach { terminal_id }
+                | ClientConnectionMode::TerminalObserve { terminal_id } => {
+                    direct_terminal_targets.insert(terminal_id.as_str());
+                }
+                ClientConnectionMode::App => {}
+            }
+        }
+        if !has_app_target && direct_terminal_targets.is_empty() {
+            return false;
+        }
+
+        sources.iter().any(|&pane_id| {
+            let terminal_id = self.terminal_id_for_pane(pane_id);
+            (has_app_target && (terminal_id.is_none() || self.app_surface_contains_pane(pane_id)))
+                || terminal_id
+                    .is_none_or(|source| direct_terminal_targets.contains(source.as_str()))
+        })
+    }
+
+    fn terminal_id_for_pane(
+        &self,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<&crate::terminal::TerminalId> {
+        if let Some(popup) = self
+            .app
+            .state
+            .popup_pane
+            .as_ref()
+            .filter(|popup| popup.pane_id == pane_id)
+        {
+            return Some(&popup.terminal_id);
+        }
+        self.app
+            .find_pane(pane_id)
+            .map(|(_, pane)| &pane.attached_terminal_id)
+    }
+
+    fn app_surface_contains_pane(&self, pane_id: crate::layout::PaneId) -> bool {
+        if self
+            .app
+            .state
+            .popup_pane
+            .as_ref()
+            .is_some_and(|popup| popup.pane_id == pane_id)
+        {
+            return true;
+        }
+        let Some(workspace) = self
+            .app
+            .state
+            .active
+            .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
+        else {
+            return false;
+        };
+        let Some(tab) = workspace.active_tab() else {
+            return false;
+        };
+        if !tab.panes.contains_key(&pane_id) {
+            return false;
+        }
+        !tab.zoomed || tab.layout.focused() == pane_id
     }
 
     fn render_retained_pty_update_and_stream(&mut self) -> bool {
@@ -3383,6 +4182,7 @@ impl HeadlessServer {
             && cell_size.is_known()
             && crate::kitty_graphics::has_visible_pane_graphics(
                 &self.app.state,
+                &self.app.pane_graphics,
                 &self.app.terminal_runtimes,
                 self.app.state.view.tab_surface(),
                 *cell_size,
@@ -3588,6 +4388,12 @@ impl HeadlessServer {
                         } else {
                             crate::kitty_graphics::HostCellSize::default()
                         };
+                    let preserved_scroll = (!is_foreground).then_some((
+                        self.app.state.workspace_scroll,
+                        self.app.state.agent_panel_scroll,
+                        self.app.state.tab_scroll,
+                        self.app.state.mobile_switcher_scroll,
+                    ));
                     let (buffer, cursor) =
                         crate::server::render_stream::render_virtual_with_runtime_registry(
                             &mut self.app.state,
@@ -3596,6 +4402,12 @@ impl HeadlessServer {
                             is_foreground,
                             render_cell_size,
                         );
+                    if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
+                        self.app.state.workspace_scroll = workspace;
+                        self.app.state.agent_panel_scroll = agent_panel;
+                        self.app.state.tab_scroll = tab;
+                        self.app.state.mobile_switcher_scroll = mobile_switcher;
+                    }
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",
                         render_started,
@@ -3666,31 +4478,48 @@ impl HeadlessServer {
                 continue;
             };
             let mut next_graphics_cache = client.graphics_cache.clone();
-            let graphics_surface_reset_pending = client.graphics_surface_reset_pending;
-            if is_app_client && self.app.state.kitty_graphics_enabled && cell_size.is_known() {
-                if graphics_surface_reset_pending {
-                    frame.graphics = next_graphics_cache.clear_bytes();
+            let mut reset_graphics = Vec::new();
+            let mut encoded = if is_app_client
+                && self.app.state.kitty_graphics_enabled
+                && cell_size.is_known()
+            {
+                if client.graphics_surface_reset_pending {
+                    if self.app.pane_graphics.slots.is_empty() {
+                        reset_graphics = next_graphics_cache.clear_bytes();
+                    } else {
+                        next_graphics_cache = crate::kitty_graphics::HostGraphicsCache::default();
+                    }
                 }
                 let graphics_started = crate::render_prof::timer();
-                frame
-                    .graphics
-                    .extend(crate::kitty_graphics::encode_local_pane_graphics(
-                        &self.app.state,
-                        &self.app.terminal_runtimes,
-                        self.app.state.view.tab_surface(),
-                        cell_size,
-                        &mut next_graphics_cache,
-                    ));
+                let encoded = crate::kitty_graphics::encode_local_pane_graphics(
+                    &self.app.state,
+                    &self.app.pane_graphics,
+                    &self.app.terminal_runtimes,
+                    self.app.state.view.tab_surface(),
+                    cell_size,
+                    Some(crate::kitty_graphics::HEADLESS_GRAPHICS_TRANSACTION_BUDGET),
+                    &mut next_graphics_cache,
+                );
                 crate::render_prof::duration_since("full_render.graphics_encode", graphics_started);
+                encoded
+            } else if self.app.pane_graphics.slots.is_empty() {
+                crate::kitty_graphics::EncodedGraphics {
+                    bytes: next_graphics_cache.clear_bytes(),
+                    incomplete: false,
+                }
             } else {
-                frame.graphics = next_graphics_cache.clear_bytes();
+                next_graphics_cache.clear_next()
+            };
+            if !reset_graphics.is_empty() {
+                reset_graphics.extend(encoded.bytes);
+                encoded.bytes = reset_graphics;
             }
+            frame.graphics = encoded.bytes;
 
             let Some(writer) = client.writer.as_ref().cloned() else {
                 crate::render_prof::event("full_render.writer_missing");
                 continue;
             };
-
             let mut commit_graphics_cache = true;
             if frame.graphics.len() > MAX_GRAPHICS_FRAME_SIZE {
                 warn!(
@@ -3701,35 +4530,36 @@ impl HeadlessServer {
                 );
                 frame.graphics.clear();
                 commit_graphics_cache = false;
+                encoded.incomplete = false;
             }
-
-            let max_frame_size = if frame.graphics.is_empty() {
-                MAX_FRAME_SIZE
-            } else {
-                MAX_GRAPHICS_FRAME_SIZE
-            };
             let has_graphics = !frame.graphics.is_empty();
             let prepare_started = crate::render_prof::timer();
             let Some(mut prepared) = client
                 .render_state
                 .prepare_frame(frame, projected_bracketed_paste)
             else {
-                client.clear_deferred_render();
+                if commit_graphics_cache {
+                    client.graphics_cache = next_graphics_cache;
+                    client.graphics_surface_reset_pending = false;
+                }
+                if encoded.incomplete {
+                    client.defer_full_render();
+                    deferred_frame = true;
+                } else {
+                    client.clear_deferred_render();
+                }
                 crate::render_prof::event("full_render.skip_identical");
                 crate::render_prof::duration_since("full_render.prepare_frame", prepare_started);
                 continue;
             };
             crate::render_prof::duration_since("full_render.prepare_frame", prepare_started);
-
-            let serialize_started = crate::render_prof::timer();
-            let serialized = match Self::frame_server_message_with_max(
-                prepared.message(),
-                max_frame_size,
-            ) {
-                Ok(framed) => {
-                    crate::render_prof::duration_since("full_render.serialize", serialize_started);
-                    framed
-                }
+            let max = if has_graphics {
+                MAX_GRAPHICS_FRAME_SIZE
+            } else {
+                crate::protocol::MAX_FRAME_SIZE
+            };
+            let serialized = match Self::frame_server_message_with_max(prepared.message(), max) {
+                Ok(frame) => frame,
                 Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
                     warn!(
                         client_id,
@@ -3737,10 +4567,6 @@ impl HeadlessServer {
                     );
                     let Some(mut text_only_frame) = prepared.into_frame() else {
                         crate::render_prof::event("full_render.serialize_error");
-                        crate::render_prof::duration_since(
-                            "full_render.serialize",
-                            serialize_started,
-                        );
                         continue;
                     };
                     text_only_frame.graphics.clear();
@@ -3749,10 +4575,6 @@ impl HeadlessServer {
                     else {
                         client.clear_deferred_render();
                         crate::render_prof::event("full_render.skip_identical_text_only");
-                        crate::render_prof::duration_since(
-                            "full_render.serialize",
-                            serialize_started,
-                        );
                         continue;
                     };
                     let framed = match Self::frame_server_message(text_only_prepared.message()) {
@@ -3761,16 +4583,12 @@ impl HeadlessServer {
                             warn!(client_id, err = %err, "failed to serialize text-only frame for client");
                             broken_clients.push(client_id);
                             crate::render_prof::event("full_render.serialize_error");
-                            crate::render_prof::duration_since(
-                                "full_render.serialize",
-                                serialize_started,
-                            );
                             continue;
                         }
                     };
                     prepared = text_only_prepared;
                     commit_graphics_cache = false;
-                    crate::render_prof::duration_since("full_render.serialize", serialize_started);
+                    encoded.incomplete = false;
                     framed
                 }
                 Err(protocol::FramingError::Oversized { claimed, max }) => {
@@ -3779,45 +4597,36 @@ impl HeadlessServer {
                         claimed, max, "skipping oversized frame for client"
                     );
                     crate::render_prof::event("full_render.serialize_oversized");
-                    crate::render_prof::duration_since("full_render.serialize", serialize_started);
                     continue;
                 }
                 Err(err) => {
-                    warn!(client_id, err = %err, "failed to serialize frame for client");
+                    warn!(client_id, err = %err, "failed to serialize frame");
                     broken_clients.push(client_id);
                     crate::render_prof::event("full_render.serialize_error");
-                    crate::render_prof::duration_since("full_render.serialize", serialize_started);
                     continue;
                 }
             };
-            crate::render_prof::counter("full_render.bytes", serialized.len() as u64);
-
-            let send_started = crate::render_prof::timer();
             match writer.render.try_send(serialized) {
                 Ok(()) => {
-                    client.clear_deferred_render();
                     if commit_graphics_cache {
                         client.graphics_cache = next_graphics_cache;
                         client.graphics_surface_reset_pending = false;
                     }
                     client.render_state.commit_sent_frame(prepared);
+                    if encoded.incomplete {
+                        client.defer_full_render();
+                        deferred_frame = true;
+                    } else {
+                        client.clear_deferred_render();
+                    }
                     crate::render_prof::event("full_render.sent");
-                    crate::render_prof::duration_since("full_render.try_send", send_started);
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     client.defer_full_render();
                     deferred_frame = true;
-                    crate::render_prof::event("full_render.queue_full");
-                    crate::render_prof::duration_since("full_render.try_send", send_started);
-                    debug!(client_id, "render queue full, deferring latest frame");
-                    continue;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    debug!(client_id, "client writer channel closed, marking as broken");
                     broken_clients.push(client_id);
-                    crate::render_prof::event("full_render.writer_disconnected");
-                    crate::render_prof::duration_since("full_render.try_send", send_started);
-                    continue;
                 }
             }
         }
@@ -3842,8 +4651,6 @@ impl HeadlessServer {
     /// (the server doesn't have a terminal to resize).
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
-
-        self.app.sync_headless_animation_timer(now);
 
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
@@ -3899,20 +4706,6 @@ impl HeadlessServer {
 
         if self
             .app
-            .next_animation_tick
-            .is_some_and(|deadline| now >= deadline)
-        {
-            self.app.state.spinner_tick = self
-                .app
-                .state
-                .spinner_tick
-                .wrapping_add(app::HEADLESS_ANIMATION_TICK_STEP);
-            self.app.next_animation_tick = Some(now + app::HEADLESS_ANIMATION_INTERVAL);
-            changed = true;
-        }
-
-        if self
-            .app
             .selection_autoscroll_deadline
             .is_some_and(|deadline| now >= deadline)
         {
@@ -3959,7 +4752,9 @@ impl HeadlessServer {
             changed = true;
         }
 
-        if geometry_dirty || self.foreground_client_id.is_none() {
+        changed |= self.app.handle_tab_bar_status_tasks(now);
+
+        if geometry_dirty {
             self.app.pending_agent_resume_deadline = None;
         } else {
             self.app.sync_pending_agent_resume_deadline(now);
@@ -3967,7 +4762,6 @@ impl HeadlessServer {
                 .app
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
-        self.app.sync_headless_animation_timer(now);
         changed
     }
 
@@ -3998,8 +4792,9 @@ impl HeadlessServer {
 
     /// Completes the shutdown sequence: send ServerShutdown to clients,
     /// close client connections, remove socket files, and clean up.
-    fn complete_shutdown(&mut self) -> io::Result<()> {
+    async fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
+        self.reject_late_client_connections().await;
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {
@@ -4013,8 +4808,8 @@ impl HeadlessServer {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // Drain remaining API requests with server_unavailable.
-        self.drain_api_requests_with_shutdown_check();
+        // Reject only the requests already queued when shutdown reached cleanup.
+        self.reject_queued_api_requests_for_shutdown();
 
         // Close all client connections.
         let staged_files = self
@@ -4047,6 +4842,25 @@ impl HeadlessServer {
     }
 }
 
+// Pane applications render their own motion responses through PTY output. Only Herdr modes with
+// hover selection mutate the current frame directly from a plain mouse-move event.
+fn events_are_render_neutral_mouse_motion(
+    events: &[crate::raw_input::RawInputEvent],
+    mode: crate::app::Mode,
+) -> bool {
+    !events.is_empty()
+        && !mode.mouse_motion_changes_view()
+        && events.iter().all(|event| {
+            matches!(
+                event,
+                crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    ..
+                })
+            )
+        })
+}
+
 fn events_for_app_routing(
     events: Vec<crate::raw_input::RawInputEvent>,
     mut source_is_foreground: bool,
@@ -4067,6 +4881,7 @@ fn events_for_app_routing(
             }
             crate::raw_input::RawInputEvent::OuterFocusLost if !source_is_foreground => None,
             crate::raw_input::RawInputEvent::Key(_)
+            | crate::raw_input::RawInputEvent::Text(_)
             | crate::raw_input::RawInputEvent::Mouse(_)
             | crate::raw_input::RawInputEvent::Paste(_) => {
                 source_is_foreground = true;
@@ -4143,17 +4958,6 @@ fn sanitize_notification_text(value: &str, max_chars: usize) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-fn sanitize_window_title_text(value: &str, max_chars: usize) -> Option<String> {
-    let sanitized = value
-        .chars()
-        .filter(|ch| !matches!(*ch, '\u{1b}' | '\u{7}' | '\u{9c}') && !ch.is_control())
-        .take(max_chars)
-        .collect::<String>()
-        .trim()
-        .to_string();
-    (!sanitized.is_empty()).then_some(sanitized)
-}
-
 fn server_config_diagnostic_summaries(diagnostics: &[String]) -> (Option<String>, Option<String>) {
     let without_keybindings = diagnostics
         .iter()
@@ -4194,9 +4998,14 @@ pub fn run_server() -> io::Result<()> {
     let loaded_config = config::Config::load();
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
+    let should_quit = Arc::new(AtomicBool::new(false));
 
     // Start the JSON API socket server.
-    let _api_server = match api::start_server(api_tx.clone(), event_hub.clone()) {
+    let _api_server = match api::start_server_with_stop_control(
+        api_tx.clone(),
+        event_hub.clone(),
+        should_quit.clone(),
+    ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: herdr server is already running");
@@ -4239,6 +5048,7 @@ pub fn run_server() -> io::Result<()> {
             &loaded_config.diagnostics,
             Some(api_tx.clone()),
             Some(_api_server),
+            should_quit,
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -4255,6 +5065,7 @@ pub fn run_server() -> io::Result<()> {
             "herdr server started"
         );
         print_ready_message(&api::socket_path(), &client_socket_path());
+        server.app.run_plugin_startup_hooks();
 
         server.run().await
     });
@@ -4302,6 +5113,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
+    let should_quit = Arc::new(AtomicBool::new(false));
 
     let mut imports = HashMap::new();
     for (pane, fd) in received.manifest.panes.into_iter().zip(received.fds) {
@@ -4340,13 +5152,21 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
-        let api_server = api::start_server(api_tx.clone(), event_hub.clone())?;
+        let api_server = api::start_server_with_stop_control(
+            api_tx.clone(),
+            event_hub.clone(),
+            should_quit.clone(),
+        )?;
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
             Some(api_tx.clone()),
             Some(api_server),
+            should_quit,
         )?;
+        // Carried across before any client attaches, so the first title sent is
+        // the override rather than the configured one it replaced.
+        server.api_window_title = received.manifest.api_window_title.take();
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
         server.app.assume_handoff_ownership();
@@ -4357,6 +5177,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         info!("handoff import server started");
         print_ready_message(&api::socket_path(), &client_socket_path());
+        server.app.run_plugin_startup_hooks();
         server.run().await
     });
 
@@ -4417,10 +5238,47 @@ mod tests {
     use super::*;
 
     use crate::app::AppState;
-    use crate::protocol::CursorState;
+    use crate::protocol::{CellData, CursorState};
+    use unicode_width::UnicodeWidthStr;
 
     #[path = "pane_graphics.rs"]
     mod pane_graphics_tests;
+
+    #[test]
+    fn retained_render_plan_covers_each_render_path() {
+        assert_eq!(
+            retained_render_plan(RetainedRenderInput {
+                needs_full_render: true,
+                needs_graphics_render: true,
+                pty: PtyRenderState::Hidden,
+            }),
+            RetainedRenderPlan::Full
+        );
+        assert_eq!(
+            retained_render_plan(RetainedRenderInput {
+                needs_full_render: false,
+                needs_graphics_render: true,
+                pty: PtyRenderState::Hidden,
+            }),
+            RetainedRenderPlan::Graphics
+        );
+        assert_eq!(
+            retained_render_plan(RetainedRenderInput {
+                needs_full_render: false,
+                needs_graphics_render: false,
+                pty: PtyRenderState::Visible,
+            }),
+            RetainedRenderPlan::Pty
+        );
+        assert_eq!(
+            retained_render_plan(RetainedRenderInput {
+                needs_full_render: false,
+                needs_graphics_render: false,
+                pty: PtyRenderState::Hidden,
+            }),
+            RetainedRenderPlan::HiddenPty
+        );
+    }
 
     fn test_headless_server() -> HeadlessServer {
         test_headless_server_with_event_hub(api::EventHub::default())
@@ -4453,7 +5311,6 @@ mod tests {
             .set_nonblocking(ListenerNonblockingMode::Accept)
             .expect("set listener nonblocking");
         let (server_event_tx, server_event_rx) = mpsc::channel(64);
-        #[cfg(windows)]
         let should_quit = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
         spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
@@ -4472,19 +5329,20 @@ mod tests {
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
+            sent_window_title: None,
+            api_window_title: None,
             server_keybindings,
             server_config_diagnostic: None,
             server_config_diagnostic_without_keybindings: None,
             terminal_attach_owners: HashMap::new(),
+            pending_alt_screen_reads: Vec::new(),
+            deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
             handoff_in_progress: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
-            #[cfg(unix)]
-            should_quit: Arc::new(AtomicBool::new(false)),
-            #[cfg(windows)]
             should_quit,
             server_event_rx,
             server_event_tx,
@@ -4503,7 +5361,9 @@ mod tests {
     }
 
     fn read_server_frame(bytes: Vec<u8>) -> FrameData {
-        match read_server_message(bytes) {
+        match protocol::read_message(&mut std::io::Cursor::new(bytes), MAX_GRAPHICS_FRAME_SIZE)
+            .expect("decode server frame")
+        {
             ServerMessage::Frame(frame) => frame,
             other => panic!("expected frame, got {other:?}"),
         }
@@ -4558,6 +5418,7 @@ mod tests {
             .app
             .terminal_runtimes
             .insert(terminal_id.clone(), runtime);
+        server.app.render_dirty.request_terminal_title(pane_id);
 
         let first = headless_pane_list(&mut server).pop().unwrap();
         assert_eq!(first.terminal_title.as_deref(), Some("⠋ task"));
@@ -4583,6 +5444,7 @@ mod tests {
             .get(&terminal_id)
             .unwrap()
             .test_process_pty_bytes(b"\x1b]2;\xe2\xa0\x99 task\x1b\\");
+        server.app.render_dirty.request_terminal_title(pane_id);
         let second = headless_pane_list(&mut server).pop().unwrap();
         assert_eq!(second.terminal_title.as_deref(), Some("⠙ task"));
         assert_eq!(second.terminal_title_stripped.as_deref(), Some("task"));
@@ -4598,6 +5460,7 @@ mod tests {
             },
             respond_to,
             response_write_complete: None,
+            stream_active: None,
         });
         let response: api::schema::SuccessResponse =
             serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
@@ -4613,6 +5476,23 @@ mod tests {
             .iter()
             .filter(|(_, event)| event.event == api::schema::EventKind::PaneUpdated)
             .count()
+    }
+
+    #[test]
+    fn server_stop_interrupts_server_event_backlog() {
+        let mut server = test_headless_server();
+        for client_id in 1..=64 {
+            server
+                .server_event_tx
+                .try_send(ServerEvent::ClientDisconnected { client_id })
+                .unwrap();
+        }
+
+        server.should_quit.store(true, Ordering::Release);
+
+        assert!(!server.drain_server_events());
+        assert!(server.server_event_rx.try_recv().is_ok());
+        shutdown_test_runtimes(&mut server);
     }
 
     #[test]
@@ -4638,6 +5518,7 @@ mod tests {
                 },
                 respond_to,
                 response_write_complete: None,
+                stream_active: None,
             })
         );
         let response = response_rx
@@ -4718,6 +5599,311 @@ mod tests {
         shutdown_test_runtimes(&mut server);
     }
 
+    fn window_title_test_server() -> (HeadlessServer, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("herd")];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+
+        let (client_tx, control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.promote_client_to_foreground(1);
+        drain_window_titles(&control_rx);
+        (server, control_rx)
+    }
+
+    /// The test client writer drains its queue on a background thread, so
+    /// reading a pushed message needs a timeout rather than `try_recv`.
+    fn next_window_title(
+        control_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> Option<Option<String>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let Ok(bytes) = control_rx.recv_timeout(remaining) else {
+                return None;
+            };
+            if let ServerMessage::WindowTitle { title } = read_server_message(bytes) {
+                return Some(title);
+            }
+        }
+        None
+    }
+
+    fn drain_window_titles(control_rx: &std::sync::mpsc::Receiver<Vec<u8>>) {
+        while control_rx.recv_timeout(Duration::from_millis(50)).is_ok() {}
+    }
+
+    fn no_window_title(control_rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> bool {
+        while let Ok(bytes) = control_rx.recv_timeout(Duration::from_millis(200)) {
+            if let ServerMessage::WindowTitle { .. } = read_server_message(bytes) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn window_title_waits_for_a_foreground_client_to_exist() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("herd")];
+        server.app.state.active = Some(0);
+        server.app.configure_window_title("{workspace}");
+
+        // The server renders before the first client attaches. Nothing was
+        // delivered, so nothing may be recorded as delivered either.
+        server.sync_window_title();
+        assert_eq!(server.sent_window_title, None);
+
+        let (client_tx, control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.promote_client_to_foreground(1);
+        server.sync_window_title();
+
+        assert_eq!(
+            next_window_title(&control_rx),
+            Some(Some("herd".to_string()))
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn an_attaching_client_gets_the_title_even_when_it_has_not_changed() {
+        let (mut server, first_control_rx) = window_title_test_server();
+        server.app.configure_window_title("{workspace}");
+        server.sync_window_title();
+        assert_eq!(
+            next_window_title(&first_control_rx),
+            Some(Some("herd".to_string()))
+        );
+
+        // ClientConnected assigns the foreground client directly rather than
+        // going through promote_client_to_foreground, so the cache must notice
+        // the new client on its own.
+        let (client_tx, second_control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+        server.sync_window_title();
+
+        assert_eq!(
+            next_window_title(&second_control_rx),
+            Some(Some("herd".to_string()))
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn configured_window_title_reaches_the_foreground_client_once_per_change() {
+        let (mut server, control_rx) = window_title_test_server();
+        server.app.configure_window_title("{workspace}/{tab}");
+
+        server.sync_window_title();
+        assert_eq!(
+            next_window_title(&control_rx),
+            Some(Some("herd/1".to_string()))
+        );
+
+        // An unchanged title must not re-emit an OSC on every render.
+        server.sync_window_title();
+        assert!(no_window_title(&control_rx));
+
+        server.app.state.workspaces[0].tabs[0].custom_name = Some("build".into());
+        server.sync_window_title();
+        assert_eq!(
+            next_window_title(&control_rx),
+            Some(Some("herd/build".to_string()))
+        );
+
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn focused_terminal_title_syncs_without_requesting_a_sidebar_render() {
+        let (mut server, control_rx) = window_title_test_server();
+        server.app.configure_window_title("{terminal_title}");
+        server.app.state.ensure_test_terminals();
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = server.app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal")
+            .clone();
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
+        runtime.test_process_pty_bytes("\x1b]0;⠋ building\x07".as_bytes());
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+
+        assert_eq!(
+            server.sync_terminal_title_sources(&HashSet::from([pane_id])),
+            (false, true)
+        );
+        assert_eq!(
+            next_window_title(&control_rx),
+            Some(Some("building".to_string()))
+        );
+
+        server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("runtime")
+            .test_process_pty_bytes("\x1b]0;⠙ building\x07".as_bytes());
+        assert_eq!(
+            server.sync_terminal_title_sources(&HashSet::from([pane_id])),
+            (false, true)
+        );
+        assert!(no_window_title(&control_rx));
+
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn a_foreground_client_without_a_writer_does_not_cache_the_window_title() {
+        let (mut server, _control_rx) = window_title_test_server();
+        server.app.configure_window_title("{workspace}");
+
+        // A detached client keeps its entry but loses its writer, so nothing
+        // reaches a terminal even though the targeted send reports success.
+        if let Some(client) = server.clients.get_mut(&1) {
+            client.writer = None;
+        }
+        server.sync_window_title();
+        assert!(server.sent_window_title.is_none());
+
+        // Attaching again has to deliver the title rather than skip it as sent.
+        let (client_tx, control_rx, _render_rx) = test_client_writer();
+        if let Some(client) = server.clients.get_mut(&1) {
+            client.writer = Some(client_tx);
+        }
+        server.sync_window_title();
+        assert_eq!(
+            next_window_title(&control_rx),
+            Some(Some("herd".to_string()))
+        );
+
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn empty_window_title_config_leaves_the_outer_title_alone() {
+        let (mut server, control_rx) = window_title_test_server();
+        server.app.configure_window_title("");
+
+        server.sync_window_title();
+
+        assert!(no_window_title(&control_rx));
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn api_window_title_wins_until_it_is_cleared() {
+        let (mut server, control_rx) = window_title_test_server();
+        server.app.configure_window_title("{workspace}");
+
+        server.handle_client_window_title_api("set".into(), Some("herdr api".into()));
+        assert_eq!(
+            next_window_title(&control_rx),
+            Some(Some("herdr api".to_string()))
+        );
+
+        server.app.state.workspaces[0].custom_name = Some("ops".into());
+        server.sync_window_title();
+        assert!(no_window_title(&control_rx));
+
+        // Clearing hands the title back to ui.window_title, not to "herdr".
+        server.handle_client_window_title_api("clear".into(), None);
+        assert_eq!(
+            next_window_title(&control_rx),
+            Some(Some("ops".to_string()))
+        );
+
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn clearing_the_api_title_falls_back_to_herdr_when_window_titles_are_disabled() {
+        let (mut server, control_rx) = window_title_test_server();
+        server.app.configure_window_title("");
+
+        server.handle_client_window_title_api("set".into(), Some("herdr api".into()));
+        assert_eq!(
+            next_window_title(&control_rx),
+            Some(Some("herdr api".to_string()))
+        );
+
+        server.handle_client_window_title_api("clear".into(), None);
+        assert_eq!(next_window_title(&control_rx), Some(None));
+
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn a_newly_promoted_client_gets_the_window_title_again() {
+        let (mut server, first_control_rx) = window_title_test_server();
+        server.app.configure_window_title("{workspace}");
+        server.sync_window_title();
+        assert_eq!(
+            next_window_title(&first_control_rx),
+            Some(Some("herd".to_string()))
+        );
+
+        // A second terminal starts on whatever its shell or ssh left behind.
+        let (client_tx, second_control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.promote_client_to_foreground(2);
+        server.sync_window_title();
+
+        assert_eq!(
+            next_window_title(&second_control_rx),
+            Some(Some("herd".to_string()))
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
     fn test_client_writer() -> (
         ClientWriter,
         std::sync::mpsc::Receiver<Vec<u8>>,
@@ -4771,6 +5957,38 @@ mod tests {
         (server, client_rx, pane_id)
     }
 
+    fn hidden_pty_visibility_test_server(
+        client_sizes: &[(u16, u16)],
+    ) -> (HeadlessServer, crate::layout::PaneId) {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let background_tab = workspace.test_add_tab(Some("background"));
+        let background_pane = workspace.tabs[background_tab].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        for (index, &terminal_size) in client_sizes.iter().enumerate() {
+            let client_id = index as u64 + 1;
+            let (client_tx, _client_control_rx, _client_rx) = test_client_writer();
+            server.clients.insert(
+                client_id,
+                ClientConnection::new(
+                    terminal_size,
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    client_id,
+                    RenderEncoding::SemanticFrame,
+                    Some(client_tx),
+                ),
+            );
+        }
+
+        (server, background_pane)
+    }
+
     fn assert_frame_data_eq(actual: &FrameData, expected: &FrameData) {
         assert_eq!(
             (actual.width, actual.height),
@@ -4787,6 +6005,16 @@ mod tests {
         for (idx, (actual_cell, expected_cell)) in
             actual.cells.iter().zip(expected.cells.iter()).enumerate()
         {
+            if cells_equivalent_for_frame_compare(
+                &actual.cells,
+                &expected.cells,
+                usize::from(actual.width),
+                idx,
+                actual_cell,
+                expected_cell,
+            ) {
+                continue;
+            }
             assert_eq!(
                 actual_cell,
                 expected_cell,
@@ -4795,6 +6023,101 @@ mod tests {
                 idx / usize::from(actual.width),
             );
         }
+    }
+
+    fn cells_equivalent_for_frame_compare(
+        actual_cells: &[CellData],
+        expected_cells: &[CellData],
+        width: usize,
+        idx: usize,
+        actual: &CellData,
+        expected: &CellData,
+    ) -> bool {
+        if actual == expected {
+            return true;
+        }
+        if !cell_style_without_symbol_eq(actual, expected) {
+            return false;
+        }
+        if !matches!(
+            (actual.symbol.as_str(), expected.symbol.as_str()),
+            ("", " ") | (" ", "")
+        ) {
+            return false;
+        }
+        covered_by_previous_wide_cell(actual_cells, width, idx)
+            || covered_by_previous_wide_cell(expected_cells, width, idx)
+    }
+
+    fn cell_style_without_symbol_eq(a: &CellData, b: &CellData) -> bool {
+        a.fg == b.fg
+            && a.bg == b.bg
+            && a.modifier == b.modifier
+            && a.skip == b.skip
+            && a.hyperlink == b.hyperlink
+    }
+
+    fn covered_by_previous_wide_cell(cells: &[CellData], width: usize, idx: usize) -> bool {
+        if idx == 0 || idx.is_multiple_of(width) {
+            return false;
+        }
+        frame_cell_display_width(&cells[idx - 1]) > 1
+    }
+
+    fn frame_cell_display_width(cell: &CellData) -> usize {
+        if is_halfwidth_katakana_voiced_grapheme(&cell.symbol) {
+            return 2;
+        }
+        cell.symbol.width()
+    }
+
+    fn is_halfwidth_katakana_voiced_grapheme(symbol: &str) -> bool {
+        let mut chars = symbol.chars();
+        let Some(base) = chars.next() else {
+            return false;
+        };
+        let Some(mark) = chars.next() else {
+            return false;
+        };
+        chars.next().is_none()
+            && ('\u{ff66}'..='\u{ff9d}').contains(&base)
+            && matches!(mark, '\u{ff9e}' | '\u{ff9f}')
+    }
+
+    #[test]
+    fn direct_graphics_requires_one_negotiated_app_client() {
+        let mut server = test_headless_server();
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 10,
+            cell_height_px: 20,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            direct_graphics: true,
+            writer: writer_a,
+        }));
+        assert!(server.clients[&1].direct_graphics);
+        assert!(server.clients[&1].pixel_mouse);
+        assert!(server.direct_graphics_available());
+
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 2,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 10,
+            cell_height_px: 20,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            direct_graphics: false,
+            writer: writer_b,
+        }));
+        assert!(!server.direct_graphics_available());
     }
 
     #[test]
@@ -4821,6 +6144,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            direct_graphics: false,
             writer: writer_a,
         }));
         assert_eq!(
@@ -4845,6 +6169,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            direct_graphics: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -4885,6 +6210,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            direct_graphics: false,
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -4898,6 +6224,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            direct_graphics: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -4941,6 +6268,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            direct_graphics: false,
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -5016,6 +6344,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
+            direct_graphics: false,
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -5036,6 +6365,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            direct_graphics: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -5070,6 +6400,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            direct_graphics: false,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -5148,9 +6479,68 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            direct_graphics: false,
             writer,
         }));
         (control_rx, render_rx)
+    }
+
+    #[test]
+    fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
+        with_terminal_session_test_server(
+            |server, terminal_id, _terminal_id_string, public_pane_id| {
+                let terminal = server
+                    .app
+                    .state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .expect("terminal");
+                terminal.detected_agent = Some(crate::detect::Agent::Claude);
+                terminal.state = crate::detect::AgentState::Working;
+                server.app.terminal_runtimes.insert(
+                    terminal_id,
+                    crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                        80,
+                        24,
+                        b"\x1b[?1049hworking",
+                    ),
+                );
+                let request = api::schema::Request {
+                    id: "read".into(),
+                    method: api::schema::Method::AgentRead(api::schema::AgentReadParams {
+                        target: public_pane_id.clone(),
+                        source: api::schema::ReadSource::Recent,
+                        lines: Some(200),
+                        format: api::schema::ReadFormat::Text,
+                        strip_ansi: true,
+                    }),
+                };
+
+                assert_eq!(
+                    server.agent_read_not_idle_error(&request),
+                    Some(api::schema::ErrorBody {
+                        code: "agent_not_idle".into(),
+                        message: format!(
+                            "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
+                        ),
+                    })
+                );
+
+                let mut default_request = request.clone();
+                let api::schema::Method::AgentRead(params) = &mut default_request.method else {
+                    unreachable!();
+                };
+                params.lines = None;
+                assert_eq!(server.agent_read_not_idle_error(&default_request), None);
+
+                let mut visible_request = request;
+                let api::schema::Method::AgentRead(params) = &mut visible_request.method else {
+                    unreachable!();
+                };
+                params.source = api::schema::ReadSource::Visible;
+                assert_eq!(server.agent_read_not_idle_error(&visible_request), None);
+            },
+        );
     }
 
     #[test]
@@ -5319,6 +6709,58 @@ next_tab = ""
                     .contains(&terminal_id));
             },
         );
+    }
+
+    #[test]
+    fn terminal_control_rejects_attach_during_alt_screen_read() {
+        with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+            let (respond_to, _response_rx) = std::sync::mpsc::channel();
+            server.pending_alt_screen_reads.push(
+                crate::server::alt_screen_read::PendingAltScreenRead::start(
+                    terminal_id,
+                    "read".into(),
+                    respond_to,
+                    "fallback".into(),
+                    api::schema::PaneReadResult {
+                        pane_id: "w1:p1".into(),
+                        workspace_id: "w1".into(),
+                        tab_id: "w1:t1".into(),
+                        source: api::schema::ReadSource::Recent,
+                        format: api::schema::ReadFormat::Text,
+                        text: String::new(),
+                        revision: 0,
+                        truncated: false,
+                    },
+                    120,
+                    false,
+                    crate::terminal::ScreenSnapshot {
+                        cols: 80,
+                        rows: Vec::new(),
+                    },
+                    Instant::now(),
+                ),
+            );
+            let control_rx = connect_pending_terminal_client_with_control_rx(server, 7);
+
+            assert!(
+                !server.handle_server_event(ServerEvent::ClientControlTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+            assert!(!server.clients.contains_key(&7));
+            assert!(!server
+                .terminal_attach_owners
+                .contains_key(&terminal_id_string));
+            let reason = read_server_shutdown_reason(control_rx.recv().expect("shutdown message"));
+            assert_eq!(
+                reason,
+                Some(format!(
+                    "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
+                ))
+            );
+        });
     }
 
     #[test]
@@ -5526,6 +6968,7 @@ next_tab = ""
             render_encoding,
             keybindings: None,
             direct_attach_requested: false,
+            direct_graphics: false,
             writer,
         }));
 
@@ -5560,6 +7003,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            direct_graphics: false,
             writer,
         }));
 
@@ -5593,6 +7037,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            direct_graphics: false,
             writer,
         }));
         assert!(server.has_app_client());
@@ -5613,6 +7058,61 @@ next_tab = ""
     #[test]
     fn semantic_app_client_marks_git_refresh_due_on_first_attach() {
         app_client_marks_git_refresh_due_on_first_attach(RenderEncoding::SemanticFrame);
+    }
+
+    #[test]
+    fn unchanged_git_refresh_does_not_request_headless_render() {
+        let mut server = test_headless_server();
+        server.app.git_refresh_in_flight = true;
+        let mut workspace = crate::workspace::Workspace::test_new("one");
+        let workspace_id = workspace.id.clone();
+        let cwd = workspace.identity_cwd.clone();
+        workspace.cached_auto_label = "cached".into();
+        workspace.cached_git_status_key = cwd.clone();
+        workspace.cached_git_branch = None;
+        server.app.state.workspaces.push(workspace);
+
+        let changed = server.handle_internal_event_with_forwarding(AppEvent::GitStatusRefreshed {
+            results: vec![crate::workspace::WorkspaceGitStatus {
+                workspace_id,
+                resolved_identity_cwd: cwd.clone(),
+                status_cache_key: cwd,
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "cached".into(),
+                branch: None,
+                ahead_behind: None,
+                space: None,
+            }],
+            cache_updates: Vec::new(),
+        });
+
+        assert!(!changed);
+        assert!(!server.app.git_refresh_in_flight);
+    }
+
+    #[test]
+    fn changed_git_refresh_requests_headless_render() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("one");
+        let workspace_id = workspace.id.clone();
+        let cwd = workspace.identity_cwd.clone();
+        server.app.state.workspaces.push(workspace);
+
+        let changed = server.handle_internal_event_with_forwarding(AppEvent::GitStatusRefreshed {
+            results: vec![crate::workspace::WorkspaceGitStatus {
+                workspace_id,
+                resolved_identity_cwd: cwd.clone(),
+                status_cache_key: cwd,
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "one".into(),
+                branch: Some("changed".into()),
+                ahead_behind: None,
+                space: None,
+            }],
+            cache_updates: Vec::new(),
+        });
+
+        assert!(changed);
     }
 
     #[test]
@@ -5638,6 +7138,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            direct_graphics: false,
             writer,
         }));
         assert!(
@@ -5843,6 +7344,22 @@ next_tab = ""
     }
 
     #[test]
+    fn terminal_attach_page_key_host_scrolls_shell_like_decckm_with_bracketed_paste() {
+        with_terminal_attach_page_key_runtime(b"\x1b[?1h\x1b[?2004h", 0, |runtime, input_rx| {
+            apply_terminal_attach_page_up(runtime);
+
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                4
+            );
+            assert!(input_rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
     fn terminal_attach_page_key_forwards_in_alternate_screen_without_mouse_reporting() {
         with_terminal_attach_page_key_runtime(b"\x1b[?1049h", 3, |runtime, input_rx| {
             apply_terminal_attach_page_up(runtime);
@@ -5872,7 +7389,7 @@ next_tab = ""
         assert!(
             server.handle_internal_event_with_forwarding(AppEvent::HookStateReported {
                 pane_id,
-                source: "herdr:pi".into(),
+                source: "custom:pi".into(),
                 agent_label: "pi".into(),
                 state: crate::detect::AgentState::Working,
                 message: None,
@@ -5885,7 +7402,7 @@ next_tab = ""
                 pane_id,
                 source: "user:pi-display".into(),
                 agent_label: Some("pi".into()),
-                applies_to_source: Some("herdr:pi".into()),
+                applies_to_source: Some("custom:pi".into()),
                 title: Some("short lived".into()),
                 display_agent: None,
                 state_labels: HashMap::new(),
@@ -5995,6 +7512,7 @@ next_tab = ""
                 g: 20,
                 b: 20,
             }),
+            ..Default::default()
         };
         server
             .app
@@ -6022,33 +7540,16 @@ next_tab = ""
         assert!(server.app.pending_agent_resume_deadline.is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn headless_scheduled_tasks_do_not_start_pending_agent_resume_without_foreground_client()
-    {
+    async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_client() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("restored");
         let pane_id = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
-        server.app.state.view.pane_infos = workspace.tabs[0]
-            .layout
-            .panes(ratatui::layout::Rect::new(0, 0, 80, 24));
         server.app.state.workspaces = vec![workspace];
         server.app.state.active = Some(0);
         server.app.state.ensure_test_terminals();
-        server.foreground_client_id = None;
-        server.effective_size = (80, 24);
-        server.app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
-            foreground: Some(crate::terminal_theme::RgbColor {
-                r: 220,
-                g: 220,
-                b: 220,
-            }),
-            background: Some(crate::terminal_theme::RgbColor {
-                r: 20,
-                g: 20,
-                b: 20,
-            }),
-        };
         server
             .app
             .state
@@ -6060,10 +7561,20 @@ next_tab = ""
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
-        server.app.pending_agent_resume_deadline = Some(Instant::now() - Duration::from_millis(1));
 
-        assert!(!server.handle_scheduled_tasks_headless(Instant::now(), false));
+        server.render_and_stream();
+        assert_ne!(server.app.state.view.terminal_area, Rect::default());
+
+        let now = Instant::now();
+        assert!(!server.handle_scheduled_tasks_headless(now, false));
         assert!(server.app.terminal_runtimes.get(&terminal_id).is_none());
+        let deadline = server
+            .app
+            .pending_agent_resume_deadline
+            .expect("clientless resume should wait briefly for a host theme");
+
+        assert!(server.handle_scheduled_tasks_headless(deadline, false));
+        assert!(server.app.terminal_runtimes.get(&terminal_id).is_some());
         assert!(server
             .app
             .state
@@ -6071,8 +7582,8 @@ next_tab = ""
             .get(&terminal_id)
             .expect("test terminal should still exist")
             .pending_agent_resume_plan
-            .is_some());
-        assert!(server.app.pending_agent_resume_deadline.is_none());
+            .is_none());
+        shutdown_test_runtimes(&mut server);
     }
 
     #[tokio::test]
@@ -6112,6 +7623,7 @@ next_tab = ""
                 g: 20,
                 b: 20,
             }),
+            ..Default::default()
         };
         server
             .app
@@ -6547,6 +8059,7 @@ next_tab = ""
                         g: 0x22,
                         b: 0x33,
                     }),
+                    ..Default::default()
                 },
                 None,
                 1,
@@ -6570,6 +8083,7 @@ next_tab = ""
                         g: 0xee,
                         b: 0xff,
                     }),
+                    ..Default::default()
                 },
                 None,
                 2,
@@ -6617,6 +8131,7 @@ next_tab = ""
                 g: 0x50,
                 b: 0x60,
             }),
+            ..Default::default()
         };
         server.clients.insert(
             1,
@@ -6667,6 +8182,7 @@ next_tab = ""
                 crate::terminal_theme::TerminalTheme {
                     foreground: None,
                     background: Some(crate::terminal_theme::RgbColor { r: 0, g: 0, b: 0 }),
+                    ..Default::default()
                 },
                 None,
                 1,
@@ -6686,6 +8202,7 @@ next_tab = ""
                         g: 255,
                         b: 255,
                     }),
+                    ..Default::default()
                 },
                 None,
                 2,
@@ -6715,6 +8232,7 @@ next_tab = ""
                 g: 0x50,
                 b: 0x60,
             }),
+            ..Default::default()
         };
         server.app.state.host_terminal_theme = initial_theme;
         server.clients.insert(
@@ -6899,6 +8417,47 @@ next_tab = ""
     }
 
     #[tokio::test]
+    async fn background_client_focus_loss_releases_its_owned_keys() {
+        let mut server = test_headless_server();
+        let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[>15u");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.clients.insert(2, test_app_client(Some(true), 2));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('j'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::FocusLost],
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded press"),
+            Bytes::from_static(b"\x1b[106;1:1u")
+        );
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("synthetic release from background client"),
+            Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(server.app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
     async fn structured_outer_focus_events_reach_reporting_pane() {
         let mut server = test_headless_server();
         let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[?1004h");
@@ -6939,6 +8498,10 @@ next_tab = ""
                     code: crate::protocol::ClientKeyCode::Char('x'),
                     modifiers: 0,
                     kind: crate::protocol::ClientKeyKind::Release,
+
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::Synthesized,
                 },
                 crate::protocol::ClientInputEvent::FocusLost,
             ],
@@ -6989,9 +8552,146 @@ next_tab = ""
                 code: crate::protocol::ClientKeyCode::Char('x'),
                 modifiers: 0,
                 kind: crate::protocol::ClientKeyKind::Release,
+
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
             }],
         }));
         assert_eq!(server.foreground_client_id, Some(3));
+    }
+
+    #[test]
+    fn terminal_attach_resize_preserves_known_cell_size_when_pixels_are_omitted() {
+        with_terminal_session_test_server(|server, _terminal_id, terminal_id, _pane_id| {
+            let mut client = ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize {
+                    width_px: 10,
+                    height_px: 20,
+                },
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            );
+            client.mode = ClientConnectionMode::TerminalAttach {
+                terminal_id: terminal_id.clone(),
+            };
+            server.clients.insert(1, client);
+
+            assert!(server.handle_server_event(ServerEvent::ClientResize {
+                client_id: 1,
+                cols: 100,
+                rows: 30,
+                cell_width_px: 0,
+                cell_height_px: 0,
+            }));
+
+            assert_eq!(
+                server
+                    .runtime_for_terminal_id_string(&terminal_id)
+                    .unwrap()
+                    .pixel_size(),
+                Some((1_000, 600))
+            );
+            assert_eq!(
+                server.clients[&1].cell_size,
+                crate::kitty_graphics::HostCellSize {
+                    width_px: 10,
+                    height_px: 20,
+                }
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn passive_mouse_motion_forwards_without_requesting_render() {
+        let mut server = test_headless_server();
+        let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[?1003h\x1b[?1006h");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let baseline = FrameData {
+            cells: Vec::new(),
+            width: 0,
+            height: 0,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let client = server.clients.get_mut(&1).unwrap();
+        let prepared = client
+            .render_state
+            .prepare_frame(baseline.clone(), None)
+            .expect("new semantic baseline");
+        client.render_state.commit_sent_frame(prepared);
+        let pane = server.app.state.view.pane_infos[0].clone();
+        let column = pane.inner_rect.x + 2;
+        let row = pane.inner_rect.y + 3;
+        let input = format!("\x1b[<35;{};{}M", column + 1, row + 1).into_bytes();
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: input,
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded mouse motion"),
+            Bytes::from_static(b"\x1b[<35;3;4M")
+        );
+        assert_eq!(
+            server.clients[&1].render_state.last_frame(),
+            Some(&baseline)
+        );
+    }
+
+    #[test]
+    fn background_mouse_motion_promotes_once_then_becomes_render_neutral() {
+        let mut server = test_headless_server();
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.clients.insert(2, test_app_client(Some(true), 2));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        let motion = || ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: 10,
+                row: 5,
+                modifiers: 0,
+            }],
+        };
+
+        assert!(server.handle_server_event(motion()));
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert!(!server.handle_server_event(motion()));
+    }
+
+    #[test]
+    fn mouse_motion_in_hover_modes_requires_render() {
+        let events = [crate::raw_input::RawInputEvent::Mouse(
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::empty(),
+            },
+        )];
+
+        assert!(events_are_render_neutral_mouse_motion(
+            &events,
+            crate::app::Mode::Terminal
+        ));
+        for mode in [
+            crate::app::Mode::GlobalMenu,
+            crate::app::Mode::ContextMenu,
+            crate::app::Mode::Navigator,
+        ] {
+            assert!(!events_are_render_neutral_mouse_motion(&events, mode));
+        }
     }
 
     fn install_focused_test_runtime(
@@ -7112,6 +8812,10 @@ next_tab = ""
                 code: crate::protocol::ClientKeyCode::Enter,
                 modifiers: 0,
                 kind: crate::protocol::ClientKeyKind::Press,
+
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
             }],
         }));
 
@@ -7148,6 +8852,10 @@ next_tab = ""
                 code: crate::protocol::ClientKeyCode::Esc,
                 modifiers: 0,
                 kind: crate::protocol::ClientKeyKind::Press,
+
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
             }],
         }));
 
@@ -7181,6 +8889,10 @@ next_tab = ""
                 code: crate::protocol::ClientKeyCode::Down,
                 modifiers: 0,
                 kind: crate::protocol::ClientKeyKind::Press,
+
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
             }],
         }));
 
@@ -7451,6 +9163,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            direct_graphics: false,
             writer,
         }));
         assert!(
@@ -7597,7 +9310,7 @@ next_tab = ""
     }
 
     #[test]
-    fn outer_focus_gained_forces_terminal_ansi_full_redraw() {
+    fn outer_focus_gained_repaints_terminal_ansi_without_clearing() {
         let mut server = test_headless_server();
         let (client_tx, _client_control_rx, client_rx) = test_client_writer();
 
@@ -7630,6 +9343,7 @@ next_tab = ""
             ServerMessage::Terminal(frame) => {
                 assert_eq!(frame.seq, 2);
                 assert!(frame.full);
+                assert!(!frame.bytes.windows(4).any(|bytes| bytes == b"\x1b[2J"));
             }
             other => panic!("expected terminal frame, got {other:?}"),
         }
@@ -7646,16 +9360,11 @@ next_tab = ""
 
         let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
             .expect("serialize dummy message");
-        server
-            .clients
-            .get(&1)
-            .unwrap()
+        server.clients[&1]
             .writer
             .as_ref()
             .unwrap()
-            .render
-            .try_send(queued)
-            .expect("pre-fill render queue");
+            .test_fill_render(queued);
 
         assert!(server.handle_server_event(ServerEvent::ClientInput {
             client_id: 1,
@@ -7786,10 +9495,7 @@ next_tab = ""
         let (client_tx, _client_control_rx, client_rx) = test_client_writer();
         let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
             .expect("serialize dummy message");
-        client_tx
-            .render
-            .try_send(queued)
-            .expect("pre-fill render queue");
+        client_tx.test_fill_render(queued);
 
         server.clients.insert(
             1,
@@ -7850,6 +9556,7 @@ next_tab = ""
                 render_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: None,
                 direct_attach_requested: true,
+                direct_graphics: false,
                 writer,
             }));
             assert!(
@@ -7896,10 +9603,7 @@ next_tab = ""
         let (client_tx, _client_control_rx, client_rx) = test_client_writer();
         let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
             .expect("serialize dummy message");
-        client_tx
-            .render
-            .try_send(queued)
-            .expect("pre-fill render queue");
+        client_tx.test_fill_render(queued);
 
         server.clients.insert(
             1,
@@ -7983,6 +9687,117 @@ next_tab = ""
             client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "identical frame should not be sent twice"
         );
+    }
+
+    #[test]
+    fn inactive_tab_pty_source_is_hidden_until_tab_focus() {
+        let (server, background_pane) = hidden_pty_visibility_test_server(&[]);
+        let sources = HashSet::from([background_pane]);
+        assert!(!server.pty_sources_visible_to_any_render_target(&sources));
+
+        let (mut server, background_pane) =
+            hidden_pty_visibility_test_server(&[(120, 40), (44, 20)]);
+        let sources = HashSet::from([background_pane]);
+        assert!(!server.pty_sources_visible_to_any_render_target(&sources));
+
+        server.app.state.workspaces[0].switch_tab(1);
+        assert!(server.pty_sources_visible_to_any_render_target(&sources));
+    }
+
+    #[tokio::test]
+    async fn hidden_pty_output_appears_after_switching_to_its_tab() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let background_tab = workspace.test_add_tab(Some("background"));
+        let background_pane = workspace.tabs[background_tab].root_pane;
+        workspace.insert_test_runtime(
+            background_pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"before"),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let (client_tx, _client_control_rx, client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        server.render_and_stream();
+        let _initial_frame = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial frame");
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, background_pane)
+            .expect("background runtime");
+        runtime.test_process_pty_bytes(b"\rhidden-update");
+        assert!(server.app.render_dirty.request_pty(background_pane));
+        let request = server.app.render_dirty.take();
+        let pty = if server.pty_sources_visible_to_any_render_target(&request.pty_sources) {
+            PtyRenderState::Visible
+        } else {
+            PtyRenderState::Hidden
+        };
+        assert_eq!(
+            retained_render_plan(RetainedRenderInput {
+                needs_full_render: false,
+                needs_graphics_render: false,
+                pty,
+            }),
+            RetainedRenderPlan::HiddenPty
+        );
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        server.app.state.workspaces[0].switch_tab(background_tab);
+        server.render_and_stream();
+        let visible_frame = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("frame after tab switch"),
+        );
+        assert!(frame_text(&visible_frame).contains("hidden-update"));
+    }
+
+    #[test]
+    fn direct_terminal_observer_keeps_hidden_pty_source_renderable() {
+        let (mut server, background_pane) = hidden_pty_visibility_test_server(&[]);
+        let terminal_id = server.app.state.workspaces[0]
+            .terminal_id(background_pane)
+            .expect("background terminal id")
+            .to_string();
+        let (client_tx, _client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::TerminalObserve { terminal_id },
+                None,
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                false,
+                Some(client_tx),
+            ),
+        );
+
+        assert!(server.pty_sources_visible_to_any_render_target(&HashSet::from([background_pane])));
     }
 
     #[tokio::test]
@@ -8073,7 +9888,91 @@ next_tab = ""
                     .recv_timeout(Duration::from_millis(100))
                     .expect("mouse capture message")
             ),
-            ServerMessage::MouseCapture { enabled: true }
+            ServerMessage::MouseCapture { enabled: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn command_mode_updates_headless_client_keyboard_flags() {
+        let mut server = test_headless_server();
+        let (client_tx, client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+
+        server.app.state.mode = crate::app::Mode::Prefix;
+        server.stream_host_keyboard_enhancement_flags();
+        assert!(matches!(
+            read_server_message(
+                client_control_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("command-mode keyboard enhancement message")
+            ),
+            ServerMessage::KittyKeyboardReportAll { enabled: true }
+        ));
+
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.stream_host_keyboard_enhancement_flags();
+        assert!(matches!(
+            read_server_message(
+                client_control_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("IME-compatible keyboard enhancement message")
+            ),
+            ServerMessage::KittyKeyboardReportAll { enabled: false }
+        ));
+    }
+
+    #[tokio::test]
+    async fn focused_report_all_pane_updates_headless_client_keyboard_flags() {
+        let mut server = test_headless_server();
+        let (client_tx, client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        let popup_runtime =
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(40, 12, b"\x1b[>15u");
+        server.app.install_test_popup_runtime(popup_runtime);
+
+        server.stream_host_keyboard_enhancement_flags();
+
+        assert!(matches!(
+            read_server_message(
+                client_control_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("keyboard enhancement message")
+            ),
+            ServerMessage::KittyKeyboardReportAll { enabled: true }
+        ));
+
+        assert!(server.app.close_popup_pane());
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.stream_host_keyboard_enhancement_flags();
+        assert!(matches!(
+            read_server_message(
+                client_control_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("IME-compatible keyboard enhancement message")
+            ),
+            ServerMessage::KittyKeyboardReportAll { enabled: false }
         ));
     }
 
@@ -8511,16 +10410,11 @@ next_tab = ""
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
         let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
             .expect("serialize dummy message");
-        server
-            .clients
-            .get(&1)
-            .unwrap()
+        server.clients[&1]
             .writer
             .as_ref()
             .unwrap()
-            .render
-            .try_send(queued)
-            .expect("pre-fill render queue");
+            .test_fill_render(queued);
         server.app.full_redraw_pending = true;
 
         server.render_and_stream();
@@ -8576,6 +10470,72 @@ next_tab = ""
             other => panic!("expected ReloadSoundConfig, got {other:?}"),
         }
         assert!(!server.app.state.request_client_config_reload);
+    }
+
+    #[test]
+    fn terminal_bell_targets_foreground_client_only() {
+        let mut server = test_headless_server();
+        let (background_tx, background_control_rx, _background_rx) = test_client_writer();
+        let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(background_tx),
+            ),
+        );
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+
+        let changed = server.handle_internal_event_with_forwarding(AppEvent::TerminalBell {
+            pane_id: crate::layout::PaneId::from_raw(1),
+            count: 3,
+        });
+
+        assert!(!changed);
+        match read_server_message(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("foreground terminal bell message"),
+        ) {
+            ServerMessage::TerminalBell { count } => assert_eq!(count, 3),
+            other => panic!("expected terminal bell message, got {other:?}"),
+        }
+        assert!(
+            background_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "background client should not receive terminal bells"
+        );
+
+        server.foreground_client_id = None;
+        server.handle_internal_event_with_forwarding(AppEvent::TerminalBell {
+            pane_id: crate::layout::PaneId::from_raw(1),
+            count: 1,
+        });
+        assert!(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "bells without a foreground client must not be retained"
+        );
     }
 
     #[test]
@@ -8662,6 +10622,7 @@ next_tab = ""
         let mut server = test_headless_server();
         let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
         drop(foreground_control_rx);
+        foreground_tx.test_close();
 
         server.clients.insert(
             1,
@@ -8857,6 +10818,78 @@ next_tab = ""
     }
 
     #[test]
+    fn oversized_paste_rejection_notifies_only_the_sending_client() {
+        let mut server = test_headless_server();
+        let (sender_writer, sender_control_rx, _sender_render_rx) = test_client_writer();
+        let (foreground_writer, foreground_control_rx, _foreground_render_rx) =
+            test_client_writer();
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(sender_writer),
+            ),
+        );
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_writer),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+
+        assert!(
+            !server.handle_server_event(ServerEvent::ClientPasteRejected {
+                client_id: 1,
+                size: 5_000_012,
+                max: 1_048_576,
+            })
+        );
+
+        match read_server_message(
+            sender_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("sending client rejection notification"),
+        ) {
+            ServerMessage::Notify {
+                kind,
+                message,
+                body,
+            } => {
+                assert_eq!(kind, protocol::NotifyKind::Toast);
+                assert_eq!(message, "Paste rejected");
+                assert_eq!(
+                    body.as_deref(),
+                    Some("Input message is 5000012 bytes; Herdr's limit is 1048576 bytes")
+                );
+            }
+            other => panic!("expected paste rejection notification, got {other:?}"),
+        }
+        assert!(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "foreground client must not receive another client's rejection"
+        );
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.clients.len(), 2);
+        assert!(server.app.state.toast.is_none());
+    }
+
+    #[test]
     fn herdr_toast_delivery_keeps_toast_in_frame_without_client_notify() {
         let mut server = test_headless_server();
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
@@ -8973,6 +11006,7 @@ next_tab = ""
             },
             respond_to,
             response_write_complete: None,
+            stream_active: None,
         });
 
         assert!(changed);
@@ -9059,6 +11093,7 @@ next_tab = ""
             },
             respond_to,
             response_write_complete: None,
+            stream_active: None,
         });
 
         assert!(changed);
@@ -9111,6 +11146,7 @@ next_tab = ""
             },
             respond_to,
             response_write_complete: None,
+            stream_active: None,
         });
 
         assert!(changed);
@@ -9143,6 +11179,7 @@ next_tab = ""
             },
             respond_to,
             response_write_complete: None,
+            stream_active: None,
         });
 
         assert!(changed);
@@ -9180,6 +11217,7 @@ next_tab = ""
                 },
                 respond_to,
                 response_write_complete: None,
+                stream_active: None,
             })
         );
 
@@ -9236,6 +11274,7 @@ next_tab = ""
                 },
                 respond_to,
                 response_write_complete: None,
+                stream_active: None,
             })
         );
 
@@ -9266,6 +11305,65 @@ next_tab = ""
             }
             other => panic!("expected api sound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn startup_idle_does_not_forward_completion() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("active");
+        let pane_id = workspace.tabs[0].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+        server.app.state.toast_config.delay_seconds = 0;
+        server.app.state.sound.enabled = true;
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+                pane_id,
+                agent: crate::detect::Agent::Pi,
+                observed_at: Instant::now(),
+            })
+        );
+
+        let (client_tx, client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(false),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        while client_control_rx
+            .recv_timeout(Duration::from_millis(20))
+            .is_ok()
+        {}
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state: crate::detect::AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            })
+        );
+        assert!(
+            client_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "startup readiness should not forward a completion notification"
+        );
     }
 
     #[test]
@@ -9464,6 +11562,34 @@ next_tab = ""
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("headless-pi-session.jsonl")
+                        .display()
+                        .to_string(),
+                )
+                .unwrap(),
+            });
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
             .set_hook_authority(
                 "herdr:pi".into(),
                 "pi".into(),
@@ -9508,6 +11634,7 @@ next_tab = ""
             },
             respond_to,
             response_write_complete: None,
+            stream_active: None,
         });
 
         assert!(changed);

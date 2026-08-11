@@ -4,10 +4,8 @@ use serde::Serialize;
 
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
-    AgentStatus, ClientWindowTitleSetParams, EmptyParams, EventData, EventMatch, EventsWaitParams,
-    Method, OutputMatch, PaneAgentState, PaneWaitForOutputParams, ReadFormat, ReadSource, Request,
-    ResponseResult, SplitDirection, SubscriptionEventData, SubscriptionEventEnvelope,
-    SubscriptionEventKind,
+    AgentStatus, ClientWindowTitleSetParams, EmptyParams, Method, PaneAgentState, ReadFormat,
+    ReadSource, Request, SplitDirection,
 };
 
 mod agent;
@@ -20,6 +18,7 @@ mod plugin;
 mod protocol_guard;
 mod runtime;
 mod server;
+mod server_not_running;
 mod spec;
 mod status;
 mod tab;
@@ -59,10 +58,25 @@ pub enum CommandOutcome {
     NotCli,
 }
 
+pub(super) fn print_read_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    if response.get("error").is_some() {
+        eprintln!("{response}");
+        return Ok(1);
+    }
+    if let Some(text) = response["result"]["read"]["text"].as_str() {
+        print!("{text}");
+    }
+    Ok(0)
+}
+
 pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     let Some(command) = args.get(1).map(|arg| arg.as_str()) else {
         return Ok(CommandOutcome::NotCli);
     };
+
+    if spec::print_requested_help(args)? {
+        return Ok(CommandOutcome::Handled(0));
+    }
 
     let exit_code = match command {
         "server" => {
@@ -84,7 +98,6 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "plugin" => plugin::run_plugin_command(&args[2..])?,
-        "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
@@ -379,26 +392,6 @@ fn run_terminal_command(args: &[String]) -> std::io::Result<i32> {
         }
         _ => {
             print_terminal_help();
-            Ok(2)
-        }
-    }
-}
-
-fn run_wait_command(args: &[String]) -> std::io::Result<i32> {
-    let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
-        print_wait_help();
-        return Ok(2);
-    };
-
-    match subcommand {
-        "output" => wait_output(&args[1..]),
-        "agent-status" => wait_agent_status(&args[1..]),
-        "help" | "--help" | "-h" => {
-            print_wait_help();
-            Ok(0)
-        }
-        _ => {
-            print_wait_help();
             Ok(2)
         }
     }
@@ -724,214 +717,6 @@ pub(super) fn parse_attach_target(args: &[String], usage: &str) -> Result<(Strin
     Ok((target.clone(), takeover))
 }
 
-fn wait_output(args: &[String]) -> std::io::Result<i32> {
-    let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex]");
-        return Ok(2);
-    };
-
-    let pane_id = normalize_pane_id(raw_pane_id);
-    let mut source = ReadSource::Recent;
-    let mut lines = None;
-    let mut timeout_ms = None;
-    let mut strip_ansi = true;
-    let mut regex = false;
-    let mut match_value = None;
-
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--match" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --match");
-                    return Ok(2);
-                };
-                match_value = Some(value.clone());
-                index += 2;
-            }
-            "--source" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --source");
-                    return Ok(2);
-                };
-                source = parse_read_source(value)?;
-                index += 2;
-            }
-            "--lines" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --lines");
-                    return Ok(2);
-                };
-                lines = Some(parse_u32_flag("--lines", value)?);
-                index += 2;
-            }
-            "--timeout" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --timeout");
-                    return Ok(2);
-                };
-                timeout_ms = Some(parse_u64_flag("--timeout", value)?);
-                index += 2;
-            }
-            "--regex" => {
-                regex = true;
-                index += 1;
-            }
-            "--raw" => {
-                strip_ansi = false;
-                index += 1;
-            }
-            other => {
-                eprintln!("unknown option: {other}");
-                return Ok(2);
-            }
-        }
-    }
-
-    let Some(match_value) = match_value else {
-        eprintln!("missing required --match");
-        return Ok(2);
-    };
-
-    let matcher = if regex {
-        OutputMatch::Regex { value: match_value }
-    } else {
-        OutputMatch::Substring { value: match_value }
-    };
-
-    let response = send_request(&Request {
-        id: "cli:wait:output".into(),
-        method: Method::PaneWaitForOutput(PaneWaitForOutputParams {
-            pane_id,
-            source,
-            lines,
-            r#match: matcher,
-            timeout_ms,
-            strip_ansi,
-        }),
-    })?;
-
-    if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
-    }
-
-    println!("{}", serde_json::to_string(&response).unwrap());
-    Ok(0)
-}
-
-fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
-    let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]");
-        return Ok(2);
-    };
-
-    let pane_id = normalize_pane_id(raw_pane_id);
-    let mut timeout_ms = None;
-    let mut desired_status = None;
-
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--status" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --status");
-                    return Ok(2);
-                };
-                desired_status = Some(parse_agent_status(value)?);
-                index += 2;
-            }
-            "--timeout" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --timeout");
-                    return Ok(2);
-                };
-                timeout_ms = Some(parse_u64_flag("--timeout", value)?);
-                index += 2;
-            }
-            other => {
-                eprintln!("unknown option: {other}");
-                return Ok(2);
-            }
-        }
-    }
-
-    let Some(agent_status) = desired_status else {
-        eprintln!("missing required --status");
-        return Ok(2);
-    };
-
-    wait_for_agent_status_change(pane_id, agent_status, timeout_ms)
-}
-
-fn wait_for_agent_status_change(
-    pane_id: String,
-    agent_status: AgentStatus,
-    timeout_ms: Option<u64>,
-) -> std::io::Result<i32> {
-    let request = Request {
-        id: "cli:wait:agent-status".into(),
-        method: Method::EventsWait(EventsWaitParams {
-            match_event: EventMatch::PaneAgentStatusChanged {
-                pane_id,
-                agent_status,
-            },
-            timeout_ms,
-        }),
-    };
-    let response = send_request(&request)?;
-    match crate::api::client::parse_response_value(response) {
-        Ok(success) => {
-            let ResponseResult::WaitMatched { event } = success.result else {
-                return Err(std::io::Error::other("unexpected wait response result"));
-            };
-            let EventData::PaneAgentStatusChanged {
-                pane_id,
-                workspace_id,
-                agent_status,
-                agent,
-                title,
-                display_agent,
-                state_labels,
-            } = event.data
-            else {
-                return Err(std::io::Error::other("unexpected wait event data"));
-            };
-            let event = SubscriptionEventEnvelope {
-                event: SubscriptionEventKind::PaneAgentStatusChanged,
-                data: SubscriptionEventData::PaneAgentStatusChanged(
-                    crate::api::schema::PaneAgentStatusChangedEvent {
-                        pane_id,
-                        workspace_id,
-                        agent_status,
-                        agent,
-                        title,
-                        display_agent,
-                        state_labels,
-                    },
-                ),
-            };
-            println!(
-                "{}",
-                serde_json::to_string(&event).map_err(std::io::Error::other)?
-            );
-            Ok(0)
-        }
-        Err(ApiClientError::ErrorResponse(response)) => {
-            if response.error.code == "timeout" {
-                eprintln!("timed out waiting for agent status change");
-            } else {
-                eprintln!(
-                    "{}",
-                    serde_json::to_string(&response).map_err(std::io::Error::other)?
-                );
-            }
-            Ok(1)
-        }
-        Err(err) => Err(api_client_error_to_io(err)),
-    }
-}
-
 pub(super) fn print_response(response: &serde_json::Value) -> std::io::Result<i32> {
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(response).unwrap());
@@ -961,17 +746,20 @@ pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Val
     ensure_server_protocol_compatible(&client, &request.id)?;
     client
         .request_value(request)
-        .map_err(api_client_error_to_io)
+        .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 
 pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde_json::Value> {
-    ApiClient::local()
+    let client = ApiClient::local();
+    client
         .request_value(request)
-        .map_err(api_client_error_to_io)
+        .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 
 fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> std::io::Result<()> {
-    let status = client.status().map_err(api_client_error_to_io)?;
+    let status = client
+        .status()
+        .map_err(|err| map_server_not_running_or_io(err, request_id, client))?;
     let server_protocol = status
         .protocol
         .ok_or_else(|| std::io::Error::other("server ping did not include a protocol version"))?;
@@ -992,6 +780,49 @@ fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> st
 
 pub(crate) fn protocol_mismatch_was_reported(err: &std::io::Error) -> bool {
     protocol_guard::was_reported(err)
+}
+
+pub(crate) fn server_not_running_was_reported(err: &std::io::Error) -> bool {
+    server_not_running::was_reported(err)
+}
+
+/// Returns the `ErrorResponse` carried by a `server_not_running` marker, if any,
+/// so the edge that surfaces the error can print it exactly once (deferred
+/// printing: recovering callers like plugin offline fallback print nothing).
+pub(crate) fn server_not_running_reported_response(
+    err: &std::io::Error,
+) -> Option<&crate::api::schema::ErrorResponse> {
+    server_not_running::reported_response(err)
+}
+
+/// True when an io::Error indicates nothing is listening on the API socket.
+/// Classify by `ErrorKind` only: Windows named pipes surface different raw
+/// errno values than Unix domain sockets but the same error kinds.
+pub(super) fn server_not_running_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Maps an `ApiClientError` from a socket command into the io::Error that
+/// bubbles up to `main`. A dead-server connect failure is reported as a
+/// friendly `server_not_running` JSON error plus a recognizable marker; all
+/// other errors fall through unchanged so existing handling is preserved.
+fn map_server_not_running_or_io(
+    err: ApiClientError,
+    request_id: &str,
+    client: &ApiClient,
+) -> std::io::Error {
+    match err {
+        ApiClientError::Io(io_err) if server_not_running_error(&io_err) => {
+            server_not_running::reported_error(server_not_running::response(
+                request_id,
+                &client.socket_path(),
+            ))
+        }
+        err => api_client_error_to_io(err),
+    }
 }
 
 fn api_client_error_to_io(err: ApiClientError) -> std::io::Error {
@@ -1082,6 +913,25 @@ pub(super) fn parse_u64_flag(flag: &str, value: &str) -> std::io::Result<u64> {
         .map_err(|_| std::io::Error::other(format!("invalid value for {flag}: {value}")))
 }
 
+/// Expand `--flag=value` tokens into separate `--flag` and `value` tokens so
+/// the hand-rolled subcommand parsers accept the same `--flag=value` form the
+/// clap-generated help and completions imply. Only `value_options` are split:
+/// boolean and unknown options keep their attached value so they still reach
+/// the parser's unknown-option branch.
+pub(super) fn expand_equals_args(args: &[String], value_options: &[&str]) -> Vec<String> {
+    let mut expanded = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.split_once('=') {
+            Some((flag, value)) if value_options.contains(&flag) => {
+                expanded.push(flag.to_string());
+                expanded.push(value.to_string());
+            }
+            _ => expanded.push(arg.clone()),
+        }
+    }
+    expanded
+}
+
 fn parse_session_json_only(args: &[String], usage: &str) -> Result<bool, i32> {
     match args {
         [] => Ok(false),
@@ -1158,14 +1008,6 @@ fn print_terminal_help() {
     eprintln!("  herdr terminal title set <title>");
     eprintln!("  herdr terminal title clear");
     eprintln!("  detach from direct attach with ctrl+b q; send literal ctrl+b with ctrl+b ctrl+b");
-}
-
-fn print_wait_help() {
-    eprintln!("herdr wait commands:");
-    eprintln!("  herdr wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]");
-    eprintln!(
-        "  herdr wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]"
-    );
 }
 
 fn print_session_help() {
@@ -1258,6 +1100,69 @@ mod tests {
         assert_eq!(
             super::parse_env_assignment("HERDR_ROLE").unwrap_err(),
             "env must use KEY=VALUE"
+        );
+    }
+
+    #[test]
+    fn maps_dead_server_connect_failure_to_friendly_error() {
+        use crate::api::client::{ApiClient, ApiClientError};
+
+        let client = ApiClient::local();
+        let socket = client.socket_path().display().to_string();
+
+        // The helper does NOT print; it returns a recognizable marker carrying
+        // the ErrorResponse so the surfacing edge can print it exactly once.
+        let mapped = super::map_server_not_running_or_io(
+            ApiClientError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            "cli:workspace:create",
+            &client,
+        );
+
+        let response = super::server_not_running::reported_response(&mapped)
+            .expect("dead-server connect failure should carry a server_not_running response");
+        assert_eq!(response.id, "cli:workspace:create");
+        assert_eq!(response.error.code, "server_not_running");
+        assert!(response.error.message.contains(&socket));
+
+        // The mapping is recognizable without string matching.
+        assert!(super::server_not_running::was_reported(&mapped));
+    }
+
+    #[test]
+    fn classifier_ignores_unrelated_io_kinds() {
+        use crate::api::client::{ApiClient, ApiClientError};
+
+        let client = ApiClient::local();
+        let mapped = super::map_server_not_running_or_io(
+            ApiClientError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            "cli:workspace:create",
+            &client,
+        );
+        assert!(!super::server_not_running::was_reported(&mapped));
+    }
+
+    #[test]
+    fn expand_equals_args_splits_value_options_only() {
+        // Known value options split; values may contain `=`. Boolean and
+        // unknown options keep the attached form so parsers still reject them.
+        let args = vec![
+            "--match=a=b".to_string(),
+            "name=value".to_string(),
+            "--raw=value".to_string(),
+            "--bogus=value".to_string(),
+            "--timeout=5000".to_string(),
+        ];
+        assert_eq!(
+            super::expand_equals_args(&args, &["--match", "--timeout"]),
+            vec![
+                "--match",
+                "a=b",
+                "name=value",
+                "--raw=value",
+                "--bogus=value",
+                "--timeout",
+                "5000",
+            ]
         );
     }
 }

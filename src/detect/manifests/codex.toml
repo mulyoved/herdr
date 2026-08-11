@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.07.13.1"
-min_engine_version = 2
-updated_at = "2026-07-13T00:00:00Z"
+version = "2026.08.09.1"
+min_engine_version = 3
+updated_at = "2026-08-09T00:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -32,6 +32,17 @@ any = [
 ]
 
 [[rules]]
+id = "trust_directory"
+state = "blocked"
+priority = 950
+region = "top_non_empty_lines(20)"
+visible_blocker = true
+all = [
+  { regex = ['\A> You are in [^\r\n]+(?:\r?\n|$)'] },
+  { regex = ['(?s)Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+directory\?'] },
+]
+
+[[rules]]
 id = "live_strong_blocker"
 state = "blocked"
 priority = 900
@@ -55,6 +66,15 @@ any = [
   { contains = ["do you want to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
   { contains = ["would you like to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
 ]
+
+[[rules]]
+id = "screen_working_fallback"
+state = "working"
+priority = 500
+region = "bottom_non_empty_lines(3)"
+visible_working = true
+line_regex = ['^[•◦]\s+Working \([^)]*esc to interrupt\)(?: · .*)?$']
+not = [{ contains = ["■ Conversation interrupted"] }]
 
 [[rules]]
 id = "osc_title_idle"

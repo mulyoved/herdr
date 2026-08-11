@@ -3,23 +3,169 @@
 ## Unreleased
 
 ### Added
-- Added named-agent `start`, `prompt`, and completion-wait workflows. Agent startup now targets an existing pane without changing topology, validates the requested interactive agent kind, and accepts optional native arguments after `--`.
-- Added `ui.sidebar_start_collapsed` to launch Herdr with the sidebar collapsed. (#1463)
-- Added macOS support for the `HERDR_AGENT=<agent>` foreground-process hint, allowing agents hidden behind host-visible wrappers such as `nono` to use the named agent's screen manifest. (#679)
+- Herdr now keeps the outer terminal window title in sync with the session through `ui.window_title`, so window managers and terminal tab bars show the active workspace and the host the panes actually run on.
+- The desktop tab bar now has configurable right-aligned status entries for zoom state, hostname, date/time, literal text, and asynchronously refreshed command output.
+- Optional `keys.move_tab_previous` and `keys.move_tab_next` bindings now reorder the active tab in place, wrapping at either end.
+- Optional `keys.resize_pane_left`, `keys.resize_pane_down`, `keys.resize_pane_up`, and `keys.resize_pane_right` bindings now resize the focused pane in one keystroke without entering resize mode.
+- Devin CLI, Cursor Agent CLI, MastraCode, Hermes Agent, and Grok CLI integrations now install and run natively on Windows.
+- Panes can now route normal right-click gestures to mouse-reporting applications through the pane menu, `herdr pane input`, `pane.input.set`, or the `pane split --right-click pane` launch option.
+- `theme.custom.sidebar_bg` can now give the desktop sidebar its own background without changing built-in theme defaults.
+- Settings and `ui.status_indicators = "symbols"` can now use distinct static shapes for blocked, working, done, idle, and unknown agent states. (#2260)
+- The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
+
+### Changed
+- Desktop tab labels are now centered in their tabs, so the active-tab highlight has symmetric padding.
+- Bumped the client/server protocol version to 20 for pane terminal bell forwarding.
+- Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
 
 ### Fixed
+- OpenCode panes now track the root conversation selected in their own TUI for native restore without adopting activity from attached clients. (#2450)
+- Server stop requests now bypass pane and API traffic, preventing busy sessions from blocking shutdown or admitting a client while shutdown is pending. (#2612)
+- Fish `Ctrl+Alt` keybindings now work in panes after legacy Alt-prefixed control bytes are decoded with both modifiers. (#2514)
+- `herdr config check` now reports unknown built-in theme names instead of silently accepting them. (#2452)
+- macOS `herdr --remote` clients now keep the accepted bridge socket blocking, preventing an immediate disconnect after the protocol handshake. (#2478, thanks @mathijshenquet)
+- Prefix keybindings now preserve Shift in WezTerm Kitty keyboard mode, so commands such as config reload no longer trigger their unshifted action. (#2435)
+- BEL characters emitted by pane programs now reach the outer terminal so its audible and visual bell settings can react. (#2453)
+- Stable direct installs, self-updates, and remote helper downloads now require and verify the SHA-256 digest published for each GitHub release asset.
+- Configs containing the retired Herdr-written `ui.agent_panel_scope` setting no longer report it as an unknown key after upgrades. (#2292)
+- Claude Code confirmation prompts using `Enter to confirm · Esc to cancel` now report `blocked` instead of `idle`. (#2268)
+- Sidebar agent lists keep scrolling when differently sized clients are attached to the same session. (#2255, thanks @aiworkflowpro)
+- `pane send-keys` and `agent send-keys` now preserve Shift when sending `shift+tab`, allowing agent permission modes to be cycled programmatically. (#1561, thanks @keinstn and @tomohisa)
+
+## [0.8.0] - 2026-08-03
+
+### Added
+- Added `herdr --skill` to print the agent skill bundled with the running Herdr binary.
+- Added `ui.pane_scrollbars = false` to hide terminal pane scrollbars and reclaim their reserved column. (#2167)
+- Added `ui.tab_bar_position = "bottom"` to place the desktop tab row below terminal panes. (#2117)
+- Added live filtering to the keybind help with `/`, Backspace, and `Ctrl+U`. (#1825, #1832, thanks @corrius)
+- Added Windows support for `experimental.switch_ascii_input_source_in_prefix` with Korean IMEs. (#1802, #1823, thanks @joonhwan)
+- Added Grok CLI session reporting and native restore with `grok --resume <id>`. (#1800, #1807, thanks @carlesso)
+- Added Antigravity CLI session reporting and native restore with `agy --conversation <id>`. (#1011, #1571, #2087, thanks @ludoo)
+- Added automatic text history reads for idle alternate-screen agents, with the application viewport restored after collection.
+- Added `workspace.move_block`, the `workspace.reordered` event, and atomic worktree-group reordering. (#1694)
+- Added a Simplified Chinese README. (#1990, thanks @patrick-xin)
+
+### Changed
+- Experimental options are no longer exposed in the Settings TUI and remain available through the config file.
+- Agent status indicators now use the same static workspace marks across the sidebar, navigator, and mobile views, eliminating continuous spinner rendering while agents work.
+- Hidden pane output no longer triggers unnecessary TUI rendering.
+- Windows preview downloads now include Herdr and a modern app-local ConPTY runtime in one archive. (#1533, #1644, #1828)
+- Worktree parents and children now stay packed together in the sidebar, including while groups are reordered.
+- Public documentation now separates stable, preview, and immutable versioned release snapshots.
+- Repository and installation links now use `herdrdev/herdr` after the GitHub organization migration.
+- Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
+
+### Fixed
+- Pane applications now receive semantic light/dark query responses and live Mode 2031 updates when the host appearance changes. (#714)
+- Remote attach now falls back to `sh` when the login shell cannot perform path discovery. (#1201)
+- PTY output continues to be read while pane input is temporarily blocked. (#1295)
+- Worktree CLI help and docs no longer advertise the redundant `--json` flag; worktree commands remain JSON-only and continue accepting the flag for compatibility. (#2171)
+- OpenCode 2 preview panes now appear as OpenCode agents and use the existing OpenCode status detection. (#2169)
+- Pane text copied through VS Code Remote Tunnels now reaches the viewing machine's clipboard instead of overwriting the remote host clipboard. (#2015)
+- Windows agent detection now follows Git Bash-launched agents across emulated `exec` process boundaries. (#2107)
+- Detached Windows servers and pane processes now survive logout from the OpenSSH session that started them. (#2008)
+- Windows `agent start` now launches agents without native arguments instead of timing out on an invalid empty PowerShell argument list. (#2072)
+- Headless servers now resume restored agent sessions without waiting for a TUI client to attach. (#2064)
+- Vibe and other Kitty-keyboard pane applications now receive shifted letters and punctuation when they request associated text. (#2020)
+- Kitty-keyboard pane applications now receive printable key releases without duplicate text input. (#1746)
+- Kitty graphics remain visible during host repaints. (#1628)
+- Pane applications now receive correct XTWINOPS terminal and cell-size query responses. (#835)
+- WSL clients query the host cell size when the terminal ioctl reports no pixels, keeping graphics sharp instead of using the 8x16 fallback. (#2146, #2160, thanks @WakaTaira)
+- Linux runtimes without terminal foreground process groups can opt into child-group agent detection with `HERDR_PROCESS_DETECTION=child-groups`. (#1982)
+- Installing the Herdr agent skill with the `skills` CLI no longer copies the entire repository. (#2022)
+- Nix builds now include the bundled agent skill required by `herdr --skill`. (#1889, #1890, thanks @olafkfreund)
+- Agent prompts now wait briefly after sending text before pressing Enter, preventing prompts from remaining in agent composers without starting a turn. (#1878)
+- Empty clipboard writes from pane applications no longer erase existing clipboard contents or show a copied confirmation. (#1893)
+- Plain mouse movement no longer triggers continuous full renders while preserving Herdr menu hover and pane application mouse tracking. (#1865)
+- Extended-button drags now preserve Herdr hover state while applications receive the drag.
+- `ui.copy_on_select = false` now retains drag and double-click word selections without copying; `Ctrl+C`, or `Cmd+C` when the host terminal forwards it, copies and clears the selection. (#1782)
+- Pane and agent read responses now report `truncated: true` when older terminal rows were omitted. (#1717)
+- Pane applications that query OSC 4 palette colors now inherit the host terminal palette. (#1752)
+- Ctrl-clicking a pane URL no longer forwards an unmatched mouse release to alternate-screen applications, preventing duplicate browser tabs. (#1761)
+- Known-agent integrations now leave pane ownership to confirmed process exit, so restarting Pi with the same saved session restores lifecycle state even with custom working UI. (#1648, #1792)
+- Nested or ephemeral Codex sessions no longer replace the owning pane's resumable session. (#1789, #1927, thanks @Pimpmuckl)
+- Pi RPC, JSON, and print processes no longer claim pane lifecycle state intended for Pi TUI sessions. (#2159, thanks @rhjoh)
+- Hermes state now comes from screen detection while its plugin reports resumable session identity, avoiding stale lifecycle authority from incomplete hooks.
+- OMP integration install, status, and uninstall now respect `PI_CONFIG_DIR` when `PI_CODING_AGENT_DIR` is not set, and installation refuses extension-directory collisions with Pi. (#1696)
+- OMP integrations now preserve Windows absolute session paths for native restore. (#2092, thanks @art-wiedzmin)
+- Claude integration updates preserve existing settings key order and formatting. (#2066)
+- Physical Escape key records on native Windows now bypass raw VT report framing, so pane applications receive Escape immediately and reliably. (#1736)
+- Native Windows key presses, grouped repeats, and releases now preserve their physical lifecycle and stay with the pane that received the initial press. (#2077)
+- Windows `pane send-keys` and `agent send-keys` now deliver semantic Escape as a complete key tap, preventing a following key from being interpreted as an Alt chord.
+- Shift+Enter now reaches native Windows pane applications with its modifier intact. (#1743, #1909, thanks @Pimpmuckl)
+- Ctrl+_ input bytes now decode as Ctrl+_ instead of Ctrl+-. (#2164, #2165, thanks @Sertug17)
+- Prefix and navigate modes now recognize non-US shifted keybindings while retaining legacy US punctuation support. (#1870)
+- Closing a non-focused workspace no longer changes the focused workspace. (#1328, #1877, thanks @yianL)
+- A background workspace that closes after its last pane exits no longer moves focus or hides the current workspace. (#1621, #1912, thanks @season179)
+- Directional pane focus now keeps Navigate mode active. (#1850, #1993, thanks @we11adam)
+- Closing a workspace's last tab through the CLI or API now closes the workspace like the TUI does. (#1760, #1899, thanks @season179)
+- Linked worktree workspaces retain their labels during Git metadata refreshes.
+- Clients repaint after transient terminal resizes instead of leaving stale or missing rows.
+- Repeated workspace Git discovery and foreground-cwd checks no longer block rendering or API handling. (#1838, #2206)
+- Relative plugin commands now resolve from the plugin root. (#1949)
+- Windows installation preserves inherited `PATH` and related environment variables. (#1947)
+- Windows agent process discovery preserves the owning parent agent across wrapper processes. (#1514)
+- The Rose Pine `surface_dim` color remains visible when the outer terminal uses a matching theme. (#1946, #2002, thanks @brabli)
+- CLI socket commands now report a clear `server_not_running` error instead of a raw I/O error. (#1941, #1963, thanks @season179)
+- Non-UTF-8 CLI arguments now produce a usage error instead of panicking. (#2207, thanks @VialFlorian)
+- Copy-mode `e` now crosses long soft-wrapped CJK lines when a read window ends on a wide glyph. (#2145, thanks @kiakiraki)
+- Clients restore terminal state when they receive SIGHUP or SIGTERM. (#2041, thanks @MattJColes)
+- Windows now shows `system` notifications and completes MP3 notification sounds without leaving PowerShell players waiting for a timeout. (#1330)
+
+## [0.7.5] - 2026-07-21
+
+### Breaking Changes
+- Installed and linked plugins, including their enabled state, are now global to the current user instead of isolated by Herdr session. Plugins installed only in a named session on Herdr 0.7.3 must be installed or linked again. (#1174)
+
+### Added
+- Added a live-agent CLI facade with named `start`, atomic `prompt`, logical `send-keys`, and server-owned `wait` workflows. Agent startup targets an existing pane without changing topology, validates the requested interactive agent kind and strict agent name, and accepts native arguments after `--`.
+- Added transient declarative Agent view queries through `agent.view.set/clear`; filtered and sorted views now define sidebar, mobile, mouse, and agent-keybind navigation order.
+- Added one-shot plugin `[[startup]]` hooks for restoring plugin-owned state after server startup and live handoff.
+- Added per-token foreground, bold, and dim styling to expanded Space and Agent sidebar row layouts.
+- Added `ui.sidebar_start_collapsed` to launch Herdr with the sidebar collapsed. (#1463)
+- Added `ui.prompt_new_workspace_name` to ask for a workspace name before interactive TUI creation.
+- Added macOS support for the `HERDR_AGENT=<agent>` foreground-process hint, allowing agents hidden behind host-visible wrappers such as `nono` to use the named agent's screen manifest. (#679)
+
+### Changed
+- Agent commands now accept only a unique live agent name or the pane ID currently hosting that agent. Names are cleared when the occupant exits, is released, or is replaced. The old top-level `wait` commands were replaced by `agent wait` and `pane wait-output`, and `agent send` was replaced by `agent send-keys`.
+- The session navigator now uses connected tree glyphs, groups matches by workspace, and automatically selects the first result when a search begins. (#1611)
+
+### Fixed
+- CLI requests now return a machine-readable `protocol_mismatch` error when the client and server protocols differ, while recovery commands remain available. (#1435)
+- Linux sound notifications now terminate and reap audio players that do not exit, preventing unavailable audio from leaving CPU-bound `mpg123` processes behind. (#1622)
+- Oversized bracketed text pastes are now rejected with a client-local notification instead of disconnecting the client. (#1665)
+- Agent prompt waits now report `agent_prompt_stalled` after five seconds without an observed state change instead of waiting indefinitely after an ineffective submission.
+- `herdr config check` now reports unknown config keys with their full paths instead of treating ignored typos as valid configuration. (#1573)
+- Codex panes with customized static terminal titles now fall back to the live working footer instead of remaining idle, while OSC activity remains preferred. (#1563)
+- Grok panes now preserve working and blocked state from terminal signals and pinned background-work status instead of falling back to idle mid-turn.
+- OpenCode lifecycle reports are now serialized so out-of-order plugin events cannot leave an idle pane marked working. (#1519)
+- Kimi question prompts now report blocked until the user answers or dismisses them.
+- Pi lifecycle reporting now uses settled events, preventing transient message boundaries from publishing an idle state mid-turn.
+- The Pi, OMP, OpenCode, and Kilo Code integrations can now be installed on Windows and report lifecycle state and native session identity through Herdr's named-pipe API. (#1531)
 - Named agent prompts now honor live bracketed-paste mode before sending Enter, preserving OpenCode text such as `A != B` instead of triggering shell mode. (#1525)
 - New panes, tabs, layouts, and workspaces using `new_cwd = "follow"` now inherit the foreground process-group leader's working directory instead of an unrelated helper process directory. (#1472)
+- Cached pane working directories no longer trigger repeated filesystem checks, avoiding slow sidebar rendering on network filesystems such as Ceph. (#1603)
+- Windows foreground-process snapshots are now shared across panes, reducing idle CPU use in sessions with many panes. (#1158)
+- Terminal diff streams now batch contiguous writes, reducing the visible wave effect while scrolling pane history. (#283)
+- A standalone Escape arriving beside another key is now preserved as its own input instead of being combined into a fabricated Alt chord. (#541)
+- Pane viewports that were following live output now continue following after a resize.
+- Mouse selections now remain visible when `ui.copy_on_select = false` while clipboard writes stay disabled. (#1471)
+- Workspace close confirmation now shows the current workspace name instead of a stale or unrelated label. (#1364)
+- Plugin command arrays now preserve whitespace-only arguments. (#1594, #1613)
+- Plugins can now be installed or linked while no Herdr server is running. (#1670)
+- Remote attach now discovers Herdr installed in mise's canonical tool path before offering to install a sidecar binary. (#1201)
 - Noninteractive update, plugin, integration, sound, custom-command, and Git subprocesses no longer flash console windows on Windows. (#1468)
 - Live handoff now preserves installed plugins and no longer lets the next plugin installation overwrite the existing registry. (#893)
-- `herdr wait agent-status` now returns `pane_not_found` promptly when its target pane closes instead of waiting for the full timeout. (#1439)
+- `herdr agent wait` now returns `agent_not_running` promptly when its target pane closes instead of waiting for the full timeout. (#1439)
+- Pane graphics streams now shut down cleanly when a client disconnect races stream teardown.
 
 ## [0.7.4] - 2026-07-15
 
 ### Added
 - Added session-modal popup floating terminal panes for `type = "popup"` custom command keybindings and plugin panes, with optional cell or percentage sizing and no changes to the tiled tab layout. (#1125)
 - Added `ui.copy_on_select` to disable automatic clipboard copying after mouse selection while keeping the selection visible.
-- Added configurable row layouts and per-occurrence foreground, bold, and dim styles for expanded Space and Agent sidebar entries, including built-in display tokens, per-agent overrides, custom metadata tokens, and pane/workspace metadata reporting through the CLI and socket API.
+- Added configurable row layouts for expanded Space and Agent sidebar entries, including built-in display tokens, per-agent overrides, custom metadata tokens, and pane/workspace metadata reporting through the CLI and socket API.
 - Added independent `row_gap` settings for expanded Space and Agent sidebar entries.
 - Copy mode now supports literal smart-case search with `/` and `?`, repeating with `n` and `N`, match highlighting, and tmux-style cross-line `w`/`b`/`e` word motions. (#1230)
 - Added Maki agent support. (#1301, #1302, thanks @tontinton)

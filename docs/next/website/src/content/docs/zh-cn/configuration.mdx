@@ -98,14 +98,14 @@ Git 工作区行提供 worktree 操作。`New worktree` 会创建检出：如果
 
 ## 远程连接
 
-远程连接默认使用临时保活设置和连接复用兜底来管理 SSH 连接。
+远程连接默认使用临时保活设置，并在支持时复用连接，以管理 SSH 连接。
 
 ```toml
 [remote]
 manage_ssh_config = true
 ```
 
-启用后，`herdr --remote` 会写入一份私有的临时 SSH 配置：先包含你的 `~/.ssh/config` 和 `/etc/ssh/ssh_config`，再添加兜底的 `ServerAliveInterval` 和 `ServerAliveCountMax` 值。你自己的保活设置优先。Herdr 还会为每次远程连接使用私有的 OpenSSH control socket，以复用首次通过身份验证的连接。设置 `manage_ssh_config = false` 可通过普通 `ssh` 进行远程连接，不使用 Herdr 生成的配置或 control socket。
+启用后，`herdr --remote` 会写入一份私有的临时 SSH 配置：先包含用户和系统 SSH 配置，再添加兜底的 `ServerAliveInterval` 和 `ServerAliveCountMax` 值。你自己的保活设置优先。Linux 和 macOS 客户端还会为每次远程连接使用私有的 OpenSSH control socket，以复用首次通过身份验证的连接；Windows OpenSSH 不使用此复用方式。设置 `manage_ssh_config = false` 可通过普通 `ssh` 进行远程连接，不使用 Herdr 生成的配置或 control socket。
 
 ## 按键绑定
 
@@ -238,6 +238,7 @@ dark_name = "catppuccin"
 
 ```toml
 [theme.custom]
+sidebar_bg = "#181825"
 panel_bg = "reset"
 accent = "#a6e3a1"
 green = "#a6e3a1"
@@ -246,11 +247,28 @@ red = "#f38ba8"
 yellow = "#f9e2af"
 ```
 
+`sidebar_bg` 可单独设置桌面侧边栏的背景色。省略时，侧边栏继续使用宿主终端背景。
+
 颜色值支持十六进制、命名颜色、`rgb(r,g,b)`，以及 `reset`、`default`、`none`、`transparent` 等重置别名。
 
 ## UI 与侧边栏
 
 侧边栏是 Herdr 的主仪表盘。在[配置参考](/docs/config-reference/)中搜索 `ui.`，可查看尺寸、折叠模式、Agent 面板排序、鼠标行为、窗格边框和其他显示设置。
+
+### 外层终端窗口标题
+
+Herdr 会模拟各窗格中的终端，因此窗格内写入的 `OSC 0`/`OSC 2` 标题只会停留在 Herdr。Herdr 会向自己所运行的终端写入自己的标题，窗口管理器和终端标签栏读取的正是这个标题：
+
+```toml
+[ui]
+window_title = "{hostname}: {workspace}"
+```
+
+可用记号为 `{hostname}`、`{workspace}`、`{tab}`、`{pane}`（聚焦窗格的手动名称）和 `{terminal_title}`（聚焦窗格自身的终端标题，已去除加载动画字符）。用 `{{` 和 `}}` 表示字面花括号。没有值的记号会渲染为空。
+
+标题在 Herdr 服务器上生成，因此即使通过 `herdr --remote` 连接或经由 SSH 运行 `herdr`，`{hostname}` 仍然指向运行窗格的那台机器。设置 `window_title = ""` 可以不改动外层终端标题。
+
+`client.window_title.set` 会覆盖配置的标题，直到 `client.window_title.clear` 将其交还。
 
 ### 侧边栏行布局
 
@@ -367,6 +385,8 @@ position = "bottom-right"
 
 选择 `herdr` 可使用应用内 toast，选择 `terminal` 可使用适合 SSH 场景的外层终端通知，选择 `system` 可使用本地操作系统通知服务，选择 `off` 可禁用弹出通知。Herdr 会抑制活动标签页的弹出通知。在[配置参考](/docs/config-reference/)中搜索 `ui.toast`，可查看位置、延迟行为和剪贴板反馈设置。
 
+在 macOS 上，`system` 会先尝试 `terminal-notifier`；如果它不可用或执行失败，则回退到 `/usr/bin/osascript`。该回退方式会在通知中心显示为 Script Editor，并且无法激活承载 Herdr 的终端。可运行 `brew install terminal-notifier` 安装 `terminal-notifier`。如果 Herdr 检测到受支持的终端，点击通知时它可以激活该终端应用。也可以选择 `terminal`，让受支持的外层终端负责发送通知。
+
 ## 声音
 
 声音通知通过本地 Herdr 客户端播放。自定义声音必须是 mp3 文件；相对路径从配置文件所在目录解析。
@@ -428,14 +448,18 @@ cjk_ime_agents = ["claude", "pi", "codex"]
 
 ## 前缀输入源切换
 
-在 macOS 上，当前缀命令和由前缀启动的模式处于活动状态时，Herdr 可以临时切换到系统中支持 ASCII 的输入源：
+在 macOS 和 Windows 上，当前缀命令和由前缀启动的模式处于活动状态时，Herdr 可以临时切换到支持 ASCII 的输入源：
 
 ```toml
 [experimental]
 switch_ascii_input_source_in_prefix = true
 ```
 
-返回终端输入或进入文本字段时，Herdr 会恢复之前的输入源。此设置在其他平台上无效。
+在 macOS 上，会切换到当前支持 ASCII 的键盘布局；在 Windows 上，会将 IME 切换到英文（ASCII）输入。返回终端输入或进入文本字段时，Herdr 会恢复之前的输入源。此设置在其他平台上无效。
+
+:::caution[Windows 上仅支持韩语 IME]
+目前 Windows 上的支持仅限于韩语 IME。使用其他语言的 IME 时，此设置不会改变输入源。
+:::
 
 ## 环境变量
 

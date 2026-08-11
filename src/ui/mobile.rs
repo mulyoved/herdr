@@ -11,10 +11,11 @@ use super::sidebar::{
     next_entry_is_indented_workspace, workspace_list_entries_expanded, AgentPanelEntry,
     WorkspaceListEntry,
 };
-use super::status::{agent_icon, state_dot};
+use super::status::{state_icon, state_icon_symbol};
 use super::text::{display_width_u16, truncate_end};
 use crate::app::state::{Palette, ToastKind, ToastNotification};
 use crate::app::AppState;
+use crate::config::StatusIndicatorStyle;
 use crate::detect::AgentState;
 use crate::layout::PaneId;
 use crate::terminal::TerminalRuntimeRegistry;
@@ -94,13 +95,12 @@ pub(crate) fn mobile_switcher_max_scroll_for_height(app: &AppState, viewport_hei
     mobile_switcher_content_height(app).saturating_sub(viewport_height as usize)
 }
 
-/// Doc-row height of the agents section (title + two rows per agent), or 0 when
-/// there are no agents so we don't show an empty header. The switcher leads with
-/// agents, so every section below it is offset by this.
+/// Doc-row height of the agents section. An active query keeps its title and an
+/// empty-state row visible even when no agents match.
 fn mobile_agents_block_height(app: &AppState) -> usize {
     let count = agent_panel_entries(app).len();
     if count == 0 {
-        0
+        usize::from(app.agent_view_override.is_some()) * 2
     } else {
         1 + count * 2
     }
@@ -136,27 +136,34 @@ pub(crate) fn mobile_switcher_target_at(
         return None;
     }
 
-    let doc_row = app
+    let scroll = app
         .mobile_switcher_scroll
-        .saturating_add(row.saturating_sub(areas.viewport.y) as usize);
+        .min(mobile_switcher_max_scroll_for_height(
+            app,
+            areas.viewport.height,
+        ));
+    let doc_row = scroll.saturating_add(row.saturating_sub(areas.viewport.y) as usize);
     let mut cursor = 0usize;
 
     // Agents lead the switcher: the primary job is switching between running
     // agents. Spaces/tabs/create actions follow for navigation and management.
-    // The section is omitted entirely when there are no agents.
     let agents = agent_panel_entries(app);
-    if !agents.is_empty() {
+    if !agents.is_empty() || app.agent_view_override.is_some() {
         cursor += 1; // agents title
-        let agents_end = cursor + agents.len() * 2;
-        if doc_row >= cursor && doc_row < agents_end {
-            let idx = (doc_row - cursor) / 2;
-            return agents.get(idx).map(|entry| MobileSwitcherTarget::Agent {
-                ws_idx: entry.ws_idx,
-                tab_idx: entry.tab_idx,
-                pane_id: entry.pane_id,
-            });
+        if agents.is_empty() {
+            cursor += 1; // active-query empty state
+        } else {
+            let agents_end = cursor + agents.len() * 2;
+            if doc_row >= cursor && doc_row < agents_end {
+                let idx = (doc_row - cursor) / 2;
+                return agents.get(idx).map(|entry| MobileSwitcherTarget::Agent {
+                    ws_idx: entry.ws_idx,
+                    tab_idx: entry.tab_idx,
+                    pane_id: entry.pane_id,
+                });
+            }
+            cursor = agents_end;
         }
-        cursor = agents_end;
     }
 
     cursor += 1; // spaces title
@@ -320,14 +327,7 @@ fn render_header_status(
     };
 
     let (state, seen) = ws.aggregate_state(&app.terminals);
-    let (dot, dot_style) = if matches!(state, AgentState::Working) {
-        (
-            super::spinner_frame(app.spinner_tick),
-            Style::default().fg(p.yellow),
-        )
-    } else {
-        state_dot(state, seen, p)
-    };
+    let (dot, dot_style) = state_icon(state, seen, app.status_indicators, p);
     let tab_label = mobile_tab_status(ws);
     let row1 = Rect::new(area.x, area.y, area.width, 1);
     let tab_w = display_width_u16(&tab_label)
@@ -407,9 +407,10 @@ fn render_switch_button(app: &AppState, frame: &mut Frame, area: Rect) {
     // "tap me" without the user reading the summary row.
     if global_agent_counts(app).blocked > 0 {
         let bx = area.x + area.width.saturating_sub(1);
+        let (symbol, style) = state_icon(AgentState::Blocked, true, app.status_indicators, p);
         frame.buffer_mut()[(bx, area.y)]
-            .set_symbol("●")
-            .set_style(Style::default().fg(p.red).bg(p.surface0));
+            .set_symbol(symbol)
+            .set_style(style.bg(p.surface0));
     }
 }
 
@@ -492,28 +493,48 @@ fn render_mobile_switcher_content(
     let mut doc_y = 0usize;
 
     let entries = agent_panel_entries_from(app, terminal_runtimes);
-    if !entries.is_empty() {
+    if !entries.is_empty() || app.agent_view_override.is_some() {
         let focused_agent = app.active.and_then(|ws_idx| {
             let ws = app.workspaces.get(ws_idx)?;
             ws.focused_pane_id()
                 .map(|pane_id| (ws_idx, ws.active_tab, pane_id))
         });
+        let title = app
+            .agent_view_override
+            .as_ref()
+            .map(|view| format!("agents · {}", view.label.as_deref().unwrap_or("filtered")))
+            .unwrap_or_else(|| "agents".to_string());
         render_section_title_at(
             frame,
             viewport,
             content,
             doc_y,
             app.mobile_switcher_scroll,
-            "agents",
+            &title,
             p,
         );
         doc_y += 1;
+        if entries.is_empty() {
+            render_one_line_item(
+                frame,
+                viewport,
+                content,
+                doc_y,
+                app.mobile_switcher_scroll,
+                ratatui::style::Color::Reset,
+                Line::from(Span::styled(
+                    "  no matching agents",
+                    Style::default().fg(p.overlay0).add_modifier(Modifier::DIM),
+                )),
+            );
+            doc_y += 1;
+        }
         for entry in &entries {
             let active = focused_agent.is_some_and(|(ws_idx, tab_idx, pane_id)| {
                 entry.ws_idx == ws_idx && entry.tab_idx == tab_idx && entry.pane_id == pane_id
             });
             let bg = mobile_item_bg(false, active, p);
-            let (icon, icon_style) = agent_icon(entry.state, entry.seen, app.spinner_tick, p);
+            let (icon, icon_style) = state_icon(entry.state, entry.seen, app.status_indicators, p);
             let title = Line::from(vec![
                 Span::styled("  ", Style::default().bg(bg)),
                 Span::styled(icon, icon_style.bg(bg)),
@@ -576,7 +597,7 @@ fn render_mobile_switcher_content(
         let selected = *ws_idx == app.selected;
         let bg = mobile_item_bg(selected, active, p);
         let (state, seen) = ws.aggregate_state(&app.terminals);
-        let (dot, dot_style) = state_dot(state, seen, p);
+        let (dot, dot_style) = state_icon(state, seen, app.status_indicators, p);
 
         let mut title_spans = vec![Span::styled("  ", Style::default().bg(bg))];
         // Worktrees of the same space render as branches off their parent, so a
@@ -968,7 +989,7 @@ impl GlobalAgentCounts {
 
 fn global_agent_counts(app: &AppState) -> GlobalAgentCounts {
     let mut counts = GlobalAgentCounts::default();
-    for entry in agent_panel_entries(app) {
+    for entry in crate::ui::all_agent_panel_entries(app) {
         match (entry.state, entry.seen) {
             (AgentState::Blocked, _) => counts.blocked += 1,
             (AgentState::Idle, false) => counts.done += 1,
@@ -991,7 +1012,10 @@ enum SummaryTone {
 
 /// Ordered, non-zero breakdown for the header roll-up: attention states lead
 /// (blocked → done → working → idle). Pure so it can be unit-tested.
-fn agent_summary_segments(counts: GlobalAgentCounts) -> Vec<(String, SummaryTone)> {
+fn agent_summary_segments(
+    counts: GlobalAgentCounts,
+    indicator_style: StatusIndicatorStyle,
+) -> Vec<(String, SummaryTone)> {
     if counts.total() == 0 {
         return vec![("no agents".to_string(), SummaryTone::Muted)];
     }
@@ -1001,20 +1025,75 @@ fn agent_summary_segments(counts: GlobalAgentCounts) -> Vec<(String, SummaryTone
     let mut segments = Vec::new();
     if counts.blocked > 0 {
         segments.push((
-            format!("◉ {} blocked", counts.blocked),
+            agent_summary_text(
+                indicator_style,
+                AgentState::Blocked,
+                true,
+                Some("◉"),
+                counts.blocked,
+                "blocked",
+            ),
             SummaryTone::Blocked,
         ));
     }
     if counts.done > 0 {
-        segments.push((format!("● {} done", counts.done), SummaryTone::Done));
+        segments.push((
+            agent_summary_text(
+                indicator_style,
+                AgentState::Idle,
+                false,
+                Some("●"),
+                counts.done,
+                "done",
+            ),
+            SummaryTone::Done,
+        ));
     }
     if counts.working > 0 {
-        segments.push((format!("{} working", counts.working), SummaryTone::Working));
+        segments.push((
+            agent_summary_text(
+                indicator_style,
+                AgentState::Working,
+                true,
+                None,
+                counts.working,
+                "working",
+            ),
+            SummaryTone::Working,
+        ));
     }
     if counts.idle > 0 {
-        segments.push((format!("{} idle", counts.idle), SummaryTone::Idle));
+        segments.push((
+            agent_summary_text(
+                indicator_style,
+                AgentState::Idle,
+                true,
+                None,
+                counts.idle,
+                "idle",
+            ),
+            SummaryTone::Idle,
+        ));
     }
     segments
+}
+
+fn agent_summary_text(
+    indicator_style: StatusIndicatorStyle,
+    state: AgentState,
+    seen: bool,
+    dot_style_symbol: Option<&str>,
+    count: usize,
+    label: &str,
+) -> String {
+    let symbol = match indicator_style {
+        StatusIndicatorStyle::Dots => dot_style_symbol,
+        StatusIndicatorStyle::Symbols => Some(state_icon_symbol(state, seen, indicator_style)),
+    };
+    match symbol {
+        Some(symbol) => format!("{symbol} {count} {label}"),
+        None => format!("{count} {label}"),
+    }
 }
 
 /// Greedily keep the most-urgent segments that fit `max_width` (counting the
@@ -1041,7 +1120,7 @@ fn fit_summary_segments(
 }
 
 fn agent_summary_line(app: &AppState, p: &Palette, max_width: u16) -> Line<'static> {
-    let segments = agent_summary_segments(global_agent_counts(app));
+    let segments = agent_summary_segments(global_agent_counts(app), app.status_indicators);
     let (shown, truncated) = fit_summary_segments(segments, max_width as usize);
 
     let mut spans = vec![Span::styled(" ", Style::default().bg(p.panel_bg))];
@@ -1140,6 +1219,7 @@ mod tests {
             terminal_title: None,
             terminal_title_stripped: None,
             agent_label: agent_label.map(str::to_string),
+            agent_kind_label: agent_label.map(str::to_string),
             agent: agent_label.and_then(crate::detect::parse_agent_label),
             state: AgentState::Idle,
             seen: true,
@@ -1150,6 +1230,40 @@ mod tests {
     }
 
     #[test]
+    fn global_agent_counts_ignore_active_agent_view_filter() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            crate::workspace::Workspace::test_new("blocked"),
+            crate::workspace::Workspace::test_new("working"),
+        ];
+        app.ensure_test_terminals();
+        for (ws_idx, state) in [(0, AgentState::Blocked), (1, AgentState::Working)] {
+            let pane_id = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(crate::detect::Agent::Claude);
+            terminal.state = state;
+        }
+        app.agent_view_override = Some(crate::api::schema::AgentViewSetParams {
+            source: "example.views".to_string(),
+            label: None,
+            filter: Some(crate::api::schema::AgentViewFilter::Eq {
+                field: crate::api::schema::AgentViewField::Builtin(
+                    crate::api::schema::AgentViewBuiltinField::Status,
+                ),
+                value: crate::api::schema::AgentViewValue::String("working".to_string()),
+            }),
+            sort: Vec::new(),
+        });
+
+        let counts = global_agent_counts(&app);
+        assert_eq!(counts.blocked, 1);
+        assert_eq!(counts.working, 1);
+    }
+
+    #[test]
     fn agent_summary_leads_with_attention_states_in_priority_order() {
         let counts = GlobalAgentCounts {
             blocked: 2,
@@ -1157,7 +1271,7 @@ mod tests {
             working: 2,
             idle: 1,
         };
-        let segments = agent_summary_segments(counts);
+        let segments = agent_summary_segments(counts, StatusIndicatorStyle::Dots);
         let labels: Vec<&str> = segments.iter().map(|(text, _)| text.as_str()).collect();
         assert_eq!(
             labels,
@@ -1167,13 +1281,59 @@ mod tests {
     }
 
     #[test]
+    fn distinct_agent_summary_uses_configured_symbols_for_every_state() {
+        let counts = GlobalAgentCounts {
+            blocked: 2,
+            done: 1,
+            working: 2,
+            idle: 1,
+        };
+        let labels: Vec<String> = agent_summary_segments(counts, StatusIndicatorStyle::Symbols)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert_eq!(
+            labels,
+            ["× 2 blocked", "✓ 1 done", "◐ 2 working", "○ 1 idle"]
+        );
+    }
+
+    #[test]
+    fn distinct_status_style_updates_mobile_blocked_badge() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("blocked")];
+        app.ensure_test_terminals();
+        app.status_indicators = StatusIndicatorStyle::Symbols;
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal_state = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal_state.detected_agent = Some(crate::detect::Agent::Claude);
+        terminal_state.state = AgentState::Blocked;
+
+        let area = Rect::new(0, 0, 12, 2);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .unwrap();
+        terminal
+            .draw(|frame| render_switch_button(&app, frame, area))
+            .unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer()[(area.width - 1, 0)].symbol(),
+            "×"
+        );
+    }
+
+    #[test]
     fn agent_summary_hides_empty_categories() {
         let counts = GlobalAgentCounts {
             done: 1,
             working: 2,
             ..Default::default()
         };
-        let labels: Vec<String> = agent_summary_segments(counts)
+        let labels: Vec<String> = agent_summary_segments(counts, StatusIndicatorStyle::Dots)
             .into_iter()
             .map(|(text, _)| text)
             .collect();
@@ -1190,7 +1350,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            agent_summary_segments(counts),
+            agent_summary_segments(counts, StatusIndicatorStyle::Dots),
             vec![("all idle".to_string(), SummaryTone::Muted)]
         );
     }
@@ -1203,7 +1363,10 @@ mod tests {
             working: 2,
             idle: 1,
         };
-        let (shown, truncated) = fit_summary_segments(agent_summary_segments(counts), 24);
+        let (shown, truncated) = fit_summary_segments(
+            agent_summary_segments(counts, StatusIndicatorStyle::Dots),
+            24,
+        );
         let labels: Vec<&str> = shown.iter().map(|(text, _)| text.as_str()).collect();
         assert_eq!(labels, vec!["◉ 2 blocked", "● 1 done"]);
         assert!(truncated);
@@ -1217,7 +1380,10 @@ mod tests {
             working: 2,
             idle: 1,
         };
-        let (shown, truncated) = fit_summary_segments(agent_summary_segments(counts), 60);
+        let (shown, truncated) = fit_summary_segments(
+            agent_summary_segments(counts, StatusIndicatorStyle::Dots),
+            60,
+        );
         assert_eq!(shown.len(), 4);
         assert!(!truncated);
     }
@@ -1225,7 +1391,7 @@ mod tests {
     #[test]
     fn agent_summary_reports_no_agents_when_empty() {
         assert_eq!(
-            agent_summary_segments(GlobalAgentCounts::default()),
+            agent_summary_segments(GlobalAgentCounts::default(), StatusIndicatorStyle::Dots,),
             vec![("no agents".to_string(), SummaryTone::Muted)]
         );
     }
@@ -1252,6 +1418,7 @@ mod tests {
         assert_eq!(mobile_switcher_workspace_doc_range(&app, 0).start, 7);
 
         let viewport = mobile_switcher_areas(&app).viewport;
+        app.mobile_switcher_scroll = 100;
         let agent_hit = mobile_switcher_target_at(&app, viewport.x + 2, viewport.y + 1);
         assert!(matches!(
             agent_hit,
@@ -1418,11 +1585,12 @@ mod tests {
             live_cwd.clone(),
             0,
             crate::terminal_theme::TerminalTheme::default(),
+            None,
             crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
             &crate::pane::PaneLaunchEnv::default(),
             events,
             std::sync::Arc::new(tokio::sync::Notify::new()),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
         )
         .unwrap();
 

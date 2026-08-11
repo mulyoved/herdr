@@ -86,6 +86,7 @@ fn agent_start_and_prompt_requests_round_trip() {
         method: Method::AgentPrompt(AgentPromptParams {
             target: "reviewer".into(),
             text: "review this".into(),
+            wait: None,
         }),
     };
     let prompt_json = serde_json::to_value(&prompt).unwrap();
@@ -93,6 +94,31 @@ fn agent_start_and_prompt_requests_round_trip() {
     assert_eq!(
         serde_json::from_value::<Request>(prompt_json).unwrap(),
         prompt
+    );
+
+    let prompt_and_wait = Request {
+        id: "prompt-and-wait".into(),
+        method: Method::AgentPrompt(AgentPromptParams {
+            target: "reviewer".into(),
+            text: "review this".into(),
+            wait: Some(AgentPromptWaitOptions {
+                until: vec![AgentStatus::Idle, AgentStatus::Done],
+                timeout_ms: Some(120_000),
+            }),
+        }),
+    };
+    let prompt_and_wait_json = serde_json::to_value(&prompt_and_wait).unwrap();
+    assert_eq!(
+        prompt_and_wait_json["params"]["wait"]["until"],
+        serde_json::json!(["idle", "done"])
+    );
+    assert_eq!(
+        prompt_and_wait_json["params"]["wait"]["timeout_ms"],
+        120_000
+    );
+    assert_eq!(
+        serde_json::from_value::<Request>(prompt_and_wait_json).unwrap(),
+        prompt_and_wait
     );
 }
 
@@ -270,6 +296,49 @@ fn client_window_title_requests_round_trip() {
 }
 
 #[test]
+fn agent_view_requests_round_trip() {
+    let set_json = serde_json::json!({
+        "id": "view-set",
+        "method": "agent.view.set",
+        "params": {
+            "source": "example.views",
+            "label": "current + attention",
+            "filter": {
+                "op": "any",
+                "filters": [
+                    {
+                        "op": "eq",
+                        "field": "workspace_id",
+                        "value": {"context": "current_workspace_id"}
+                    },
+                    {
+                        "op": "in",
+                        "field": "status",
+                        "values": ["blocked", "done"]
+                    }
+                ]
+            },
+            "sort": [
+                {"field": "attention", "order": "desc"},
+                {"field": "state_change_seq", "order": "desc"}
+            ]
+        }
+    });
+    let request: Request = serde_json::from_value(set_json.clone()).unwrap();
+    assert!(matches!(request.method, Method::AgentViewSet(_)));
+    assert_eq!(serde_json::to_value(request).unwrap(), set_json);
+
+    let clear_json = serde_json::json!({
+        "id": "view-clear",
+        "method": "agent.view.clear",
+        "params": {"source": "example.views"}
+    });
+    let request: Request = serde_json::from_value(clear_json.clone()).unwrap();
+    assert!(matches!(request.method, Method::AgentViewClear(_)));
+    assert_eq!(serde_json::to_value(request).unwrap(), clear_json);
+}
+
+#[test]
 fn unknown_method_is_rejected() {
     let json = r#"{"id":"req_1","method":"nope","params":{}}"#;
     let err = serde_json::from_str::<Request>(json)
@@ -343,10 +412,13 @@ fn pane_read_defaults_to_text_format() {
     "#;
 
     let request: Request = serde_json::from_str(json).unwrap();
+    let serialized = serde_json::to_value(&request).unwrap();
+    assert!(serialized["params"].get("intent").is_none());
     let Method::PaneRead(params) = request.method else {
         panic!("wrong method parsed");
     };
     assert_eq!(params.format, ReadFormat::Text);
+    assert_eq!(params.intent, ReadIntent::Interactive);
 }
 
 #[test]
@@ -397,6 +469,14 @@ fn event_envelope_round_trips() {
             data: EventData::WorkspaceMoved {
                 workspace_id: "w_1".into(),
                 insert_index: 2,
+                workspaces: vec![],
+            },
+        },
+        EventEnvelope {
+            event: EventKind::WorkspaceReordered,
+            data: EventData::WorkspaceReordered {
+                workspace_ids: vec!["w_1".into(), "w_2".into()],
+                before_workspace_id: Some("w_3".into()),
                 workspaces: vec![],
             },
         },
@@ -830,6 +910,7 @@ fn plugin_link_list_unlink_round_trip() {
             platforms: None,
             command: vec!["bun".into(), "install".into()],
         }],
+        startup: vec![],
         actions: vec![PluginManifestAction {
             id: "bootstrap".into(),
             title: "Bootstrap worktree".into(),
@@ -993,6 +1074,18 @@ fn authority_mutation_requests_round_trip() {
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, workspace_move);
 
+    let workspace_move_block = Request {
+        id: "move_ws_block".into(),
+        method: Method::WorkspaceMoveBlock(WorkspaceMoveBlockParams {
+            workspace_ids: vec!["w1".into(), "w2".into()],
+            before_workspace_id: Some("w3".into()),
+        }),
+    };
+    let json = serde_json::to_value(&workspace_move_block).unwrap();
+    assert_eq!(json["method"], "workspace.move_block");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, workspace_move_block);
+
     let tab_move = Request {
         id: "move_tab".into(),
         method: Method::TabMove(TabMoveParams {
@@ -1035,6 +1128,7 @@ fn authority_mutation_requests_round_trip() {
         method: Method::EventsSubscribe(EventsSubscribeParams {
             subscriptions: vec![
                 Subscription::WorkspaceMoved {},
+                Subscription::WorkspaceReordered {},
                 Subscription::TabMoved {},
                 Subscription::LayoutUpdated {},
             ],
@@ -1042,6 +1136,7 @@ fn authority_mutation_requests_round_trip() {
     };
     let json = serde_json::to_string(&subscription).unwrap();
     assert!(json.contains("\"type\":\"workspace.moved\""));
+    assert!(json.contains("\"type\":\"workspace.reordered\""));
     assert!(json.contains("\"type\":\"tab.moved\""));
     assert!(json.contains("\"type\":\"layout.updated\""));
     let restored: Request = serde_json::from_str(&json).unwrap();

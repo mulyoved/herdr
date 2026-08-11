@@ -43,6 +43,9 @@ pub(super) enum MouseAction {
         source_ws_idx: usize,
         insert_idx: usize,
     },
+    MoveWorkspaceBlock {
+        params: crate::api::schema::WorkspaceMoveBlockParams,
+    },
     MoveTab {
         ws_idx: usize,
         source_tab_idx: usize,
@@ -480,6 +483,10 @@ impl AppState {
                     }
                 }
 
+                if self.mode_bar_covers_tab_row(mouse.column, mouse.row) {
+                    return None;
+                }
+
                 if self.on_tab_scroll_left_button(mouse.column, mouse.row) {
                     self.scroll_tabs_left();
                     return None;
@@ -561,9 +568,8 @@ impl AppState {
                         self.view.workspace_card_areas.clone()
                     };
                     if let Some(card) = cards.iter().find(|card| {
-                        mouse.row == card.rect.y
-                            && mouse.column == card.rect.x
-                            && mouse.column < card.rect.x + card.rect.width
+                        let chevron = crate::ui::workspace_group_chevron_rect(card);
+                        mouse.row == chevron.y && mouse.column == chevron.x && chevron.width > 0
                     }) {
                         if let Some((key, collapsed)) =
                             crate::ui::workspace_parent_group_state(self, card.ws_idx)
@@ -627,13 +633,7 @@ impl AppState {
                     if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                         self.selection = None;
                         self.selection_autoscroll = None;
-                        if let Some(ws_idx) = self.active {
-                            return Some(MouseAction::FocusPane {
-                                ws_idx,
-                                pane_id: info.id,
-                            });
-                        }
-                        return None;
+                        return self.mouse_pane_focus_action(info.id);
                     }
 
                     let (row, col) = (
@@ -646,12 +646,7 @@ impl AppState {
                         col,
                         self.pane_scroll_metrics(terminal_runtimes, info.id),
                     ));
-                    if let Some(ws_idx) = self.active {
-                        return Some(MouseAction::FocusPane {
-                            ws_idx,
-                            pane_id: info.id,
-                        });
-                    }
+                    return self.mouse_pane_focus_action(info.id);
                 } else if let Some(info) = self.view.pane_infos.iter().find(|p| {
                     mouse.column >= p.rect.x
                         && mouse.column < p.rect.x + p.rect.width
@@ -662,12 +657,7 @@ impl AppState {
                     if self.mode != Mode::Terminal {
                         self.mode = Mode::Terminal;
                     }
-                    if let Some(ws_idx) = self.active {
-                        return Some(MouseAction::FocusPane {
-                            ws_idx,
-                            pane_id: id,
-                        });
-                    }
+                    return self.mouse_pane_focus_action(id);
                 }
             }
 
@@ -687,21 +677,21 @@ impl AppState {
                     }
                 }
 
-                let workspace_drop_index = self.workspace_drop_index_at_row(mouse.row);
+                let workspace_drop_target = self.workspace_drop_target_at_row(mouse.row);
                 let tab_drop_index = self.tab_drop_index_at(mouse.column, mouse.row);
                 if self.drag.is_none() {
                     if let Some(press) = &self.workspace_press {
                         let delta_col = mouse.column.abs_diff(press.start_col);
                         let delta_row = mouse.row.abs_diff(press.start_row);
-                        let can_reorder = self
-                            .workspaces
-                            .get(press.ws_idx)
-                            .is_some_and(|ws| ws.worktree_space().is_none());
+                        let can_reorder = self.workspaces.get(press.ws_idx).is_some_and(|ws| {
+                            ws.worktree_space()
+                                .is_none_or(|space| !space.is_linked_worktree)
+                        });
                         if can_reorder && delta_col.max(delta_row) >= WORKSPACE_DRAG_THRESHOLD {
                             self.drag = Some(DragState {
                                 target: DragTarget::WorkspaceReorder {
                                     source_ws_idx: press.ws_idx,
-                                    insert_idx: workspace_drop_index,
+                                    drop_target: workspace_drop_target,
                                 },
                             });
                         }
@@ -721,10 +711,10 @@ impl AppState {
                 }
 
                 if let Some(DragState {
-                    target: DragTarget::WorkspaceReorder { insert_idx, .. },
+                    target: DragTarget::WorkspaceReorder { drop_target, .. },
                 }) = &mut self.drag
                 {
-                    *insert_idx = workspace_drop_index;
+                    *drop_target = workspace_drop_target;
                 } else if let Some(DragState {
                     target:
                         DragTarget::TabReorder {
@@ -812,7 +802,7 @@ impl AppState {
 
             MouseEventKind::Up(MouseButton::Left) => {
                 // Mouse-up either finishes a drag selection or releases after a
-                // double-click copy; the latter is already finalized.
+                // double-click word selection; the latter is already finalized.
                 if let Some(selection) = self.selection.as_ref() {
                     let was_click = selection.was_just_click();
                     let was_finalized = selection.is_finalized();
@@ -824,7 +814,7 @@ impl AppState {
                     if was_click {
                         self.selection = None;
                     } else if was_finalized {
-                        // Double-click copy already finalized this selection.
+                        // Double-click already finalized this word selection.
                     } else if self.copy_on_select {
                         self.copy_selection(terminal_runtimes);
                     } else if let Some(selection) = self.selection.as_mut() {
@@ -853,13 +843,33 @@ impl AppState {
                         target:
                             DragTarget::WorkspaceReorder {
                                 source_ws_idx,
-                                insert_idx: Some(insert_idx),
+                                drop_target: Some(drop_target),
                             },
                     }) => {
-                        return Some(MouseAction::MoveWorkspace {
-                            source_ws_idx,
-                            insert_idx,
-                        });
+                        if let Some(params) =
+                            self.workspace_move_block_params(source_ws_idx, drop_target)
+                        {
+                            if self
+                                .workspaces
+                                .get(source_ws_idx)
+                                .is_some_and(|workspace| workspace.worktree_space().is_some())
+                            {
+                                return Some(MouseAction::MoveWorkspaceBlock { params });
+                            }
+                            let insert_idx = params
+                                .before_workspace_id
+                                .as_ref()
+                                .and_then(|id| {
+                                    self.workspaces
+                                        .iter()
+                                        .position(|workspace| workspace.id == *id)
+                                })
+                                .unwrap_or(self.workspaces.len());
+                            return Some(MouseAction::MoveWorkspace {
+                                source_ws_idx,
+                                insert_idx,
+                            });
+                        }
                     }
                     Some(DragState {
                         target:
@@ -905,6 +915,9 @@ impl AppState {
                     let _ = self.forward_pane_mouse_button(terminal_runtimes, &info, mouse);
                 }
             }
+
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if self.mode_bar_covers_tab_row(mouse.column, mouse.row) => {}
 
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 if self.on_tab_bar(mouse.column, mouse.row) =>
@@ -1057,7 +1070,8 @@ impl AppState {
             }
 
             MouseEventKind::Down(MouseButton::Right)
-                if self.tab_at(mouse.column, mouse.row).is_some() =>
+                if !self.mode_bar_covers_tab_row(mouse.column, mouse.row)
+                    && self.tab_at(mouse.column, mouse.row).is_some() =>
             {
                 if let (Some(ws_idx), Some(tab_idx)) =
                     (self.active, self.tab_at(mouse.column, mouse.row))
@@ -1085,13 +1099,16 @@ impl AppState {
                         .and_then(|ws| ws.focused_pane_id());
                     let source_pane_id =
                         previous_focused_pane_id.filter(|pane_id| *pane_id != info.id);
-                    let has_manual_label = self
+                    let pane_state = self
                         .workspaces
                         .get(ws_idx)
-                        .and_then(|ws| ws.pane_state(info.id))
+                        .and_then(|ws| ws.pane_state(info.id));
+                    let has_manual_label = pane_state
                         .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
                         .and_then(|terminal| terminal.manual_label.as_ref())
                         .is_some();
+                    let right_click_passthrough =
+                        pane_state.is_some_and(|pane| pane.right_click_passthrough);
                     self.context_menu = Some(ContextMenuState {
                         kind: ContextMenuKind::Pane {
                             ws_idx,
@@ -1099,6 +1116,7 @@ impl AppState {
                             pane_id: info.id,
                             source_pane_id,
                             has_manual_label,
+                            right_click_passthrough,
                         },
                         x: mouse.column,
                         y: mouse.row,
@@ -1266,6 +1284,15 @@ impl AppState {
             })
     }
 
+    fn mode_bar_covers_tab_row(&self, col: u16, row: u16) -> bool {
+        self.tab_bar_position == crate::config::TabBarPositionConfig::Bottom
+            && matches!(
+                self.mode,
+                Mode::Navigate | Mode::Prefix | Mode::Copy | Mode::Resize
+            )
+            && self.on_tab_bar(col, row)
+    }
+
     pub(super) fn on_tab_bar(&self, col: u16, row: u16) -> bool {
         let area = self.view.tab_bar_rect;
         area.width > 0
@@ -1414,6 +1441,16 @@ impl AppState {
             .or_else(|| self.pane_frame_at(col, row))
     }
 
+    fn mouse_pane_focus_action(&self, pane_id: crate::layout::PaneId) -> Option<MouseAction> {
+        let ws_idx = self.active?;
+        (self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.focused_pane_id())
+            != Some(pane_id))
+        .then_some(MouseAction::FocusPane { ws_idx, pane_id })
+    }
+
     pub(crate) fn pane_info_by_id(&self, pane_id: crate::layout::PaneId) -> Option<&PaneInfo> {
         self.view.pane_infos.iter().find(|info| info.id == pane_id)
     }
@@ -1532,14 +1569,22 @@ impl AppState {
             return false;
         }
 
-        let Some(modifiers) = self.right_click_passthrough_modifiers else {
+        let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() else {
             return false;
         };
-        if mouse.modifiers != modifiers {
-            return false;
-        }
-
-        let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() else {
+        let configured_modifiers = self
+            .right_click_passthrough_modifiers
+            .filter(|modifiers| mouse.modifiers == *modifiers);
+        let pane_passthrough = mouse.modifiers.is_empty()
+            && self.active.is_some_and(|ws_idx| {
+                self.workspaces
+                    .get(ws_idx)
+                    .and_then(|workspace| workspace.pane_state(info.id))
+                    .is_some_and(|pane| pane.right_click_passthrough)
+            });
+        let Some(modifiers) = configured_modifiers
+            .or_else(|| pane_passthrough.then(crossterm::event::KeyModifiers::empty))
+        else {
             return false;
         };
 
@@ -1622,6 +1667,33 @@ impl AppState {
         }
     }
 
+    fn pane_mouse_position(
+        &self,
+        runtime: &crate::terminal::TerminalRuntime,
+        inner: Rect,
+        mouse: MouseEvent,
+    ) -> Option<crate::input::mouse::Position> {
+        let column = mouse.column.saturating_sub(inner.x);
+        let row = mouse.row.saturating_sub(inner.y);
+        let cell = crate::input::mouse::Position::Cell { column, row };
+        let Some(host) = self.host_mouse_pixels else {
+            return Some(cell);
+        };
+        let wants_pixels = runtime.input_state().is_some_and(|state| {
+            state.mouse_protocol_encoding == crate::input::MouseProtocolEncoding::SgrPixels
+        });
+        if !wants_pixels {
+            return Some(cell);
+        }
+        let Some((width_px, height_px)) = runtime.pixel_size() else {
+            return Some(cell);
+        };
+        Some(
+            host.pane_position(inner, width_px, height_px)
+                .unwrap_or(cell),
+        )
+    }
+
     pub(super) fn forward_pane_mouse_button(
         &self,
         terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1635,9 +1707,10 @@ impl AppState {
         else {
             return false;
         };
-        let column = mouse.column.saturating_sub(info.inner_rect.x);
-        let row = mouse.row.saturating_sub(info.inner_rect.y);
-        let Some(bytes) = rt.encode_mouse_button(mouse.kind, column, row, mouse.modifiers) else {
+        let Some(position) = self.pane_mouse_position(rt, info.inner_rect, mouse) else {
+            return false;
+        };
+        let Some(bytes) = rt.encode_mouse_button(mouse.kind, position, mouse.modifiers) else {
             return false;
         };
         rt.scroll_reset();
@@ -1660,9 +1733,10 @@ impl AppState {
         else {
             return false;
         };
-        let column = mouse.column.saturating_sub(info.inner_rect.x);
-        let row = mouse.row.saturating_sub(info.inner_rect.y);
-        let Some(bytes) = rt.encode_mouse_motion(mouse.kind, column, row, mouse.modifiers) else {
+        let Some(position) = self.pane_mouse_position(rt, info.inner_rect, mouse) else {
+            return false;
+        };
+        let Some(bytes) = rt.encode_mouse_motion(mouse.kind, position, mouse.modifiers) else {
             return false;
         };
         if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
@@ -1688,9 +1762,10 @@ impl AppState {
             return false;
         }
         rt.scroll_reset();
-        let column = mouse.column.saturating_sub(info.inner_rect.x);
-        let row = mouse.row.saturating_sub(info.inner_rect.y);
-        let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers) else {
+        let Some(position) = self.pane_mouse_position(rt, info.inner_rect, mouse) else {
+            return false;
+        };
+        let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, position, mouse.modifiers) else {
             warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
             return true;
         };
@@ -1716,18 +1791,7 @@ impl AppState {
         match rt.wheel_routing() {
             Some(crate::pane::WheelRouting::HostScroll) | None => false,
             Some(crate::pane::WheelRouting::MouseReport) => {
-                rt.scroll_reset();
-                let column = mouse.column.saturating_sub(info.inner_rect.x);
-                let row = mouse.row.saturating_sub(info.inner_rect.y);
-                let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
-                else {
-                    warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
-                    return true;
-                };
-                if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-                    warn!(pane = info.id.raw(), err = %err, "failed to forward mouse wheel event");
-                }
-                true
+                self.forward_pane_reported_wheel(terminal_runtimes, info, mouse)
             }
             Some(crate::pane::WheelRouting::AlternateScroll) => {
                 rt.scroll_reset();
@@ -2009,7 +2073,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_right_click_passthrough_forwards_full_gesture_to_pane() {
+    async fn pane_right_click_passthrough_is_isolated() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let passthrough_pane = ws.tabs[0].root_pane;
+        let default_pane = ws.test_split(Direction::Horizontal);
+        ws.pane_state_mut(passthrough_pane)
+            .unwrap()
+            .right_click_passthrough = true;
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        let passthrough_info = app.state.pane_info_by_id(passthrough_pane).unwrap().clone();
+        let default_info = app.state.pane_info_by_id(default_pane).unwrap().clone();
+        let (passthrough_runtime, mut passthrough_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                passthrough_info.inner_rect.width,
+                passthrough_info.inner_rect.height,
+                0,
+                b"\x1b[?1002h\x1b[?1006h",
+                4,
+            );
+        let (default_runtime, mut default_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                default_info.inner_rect.width,
+                default_info.inner_rect.height,
+                0,
+                b"\x1b[?1002h\x1b[?1006h",
+                4,
+            );
+        app.state
+            .insert_test_runtime(passthrough_pane, passthrough_runtime);
+        app.state.insert_test_runtime(default_pane, default_runtime);
+
+        let col = passthrough_info.inner_rect.x + 2;
+        let row = passthrough_info.inner_rect.y + 3;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), col, row));
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.context_menu.is_none());
+        assert_eq!(
+            passthrough_input.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[<2;3;4M")
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            default_info.inner_rect.x + 2,
+            default_info.inner_rect.y + 3,
+        ));
+
+        assert!(default_input.try_recv().is_err());
+        assert!(matches!(
+            app.state.context_menu.as_ref().map(|menu| &menu.kind),
+            Some(ContextMenuKind::Pane { pane_id, .. }) if *pane_id == default_pane
+        ));
+    }
+
+    #[tokio::test]
+    async fn pane_right_click_passthrough_falls_back_when_mouse_reporting_is_off() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        ws.pane_state_mut(pane_id).unwrap().right_click_passthrough = true;
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let info = app.state.pane_info_by_id(pane_id).unwrap().clone();
+        app.state.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                b"",
+            ),
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            info.inner_rect.x + 2,
+            info.inner_rect.y + 3,
+        ));
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        assert!(app.state.context_menu.is_some());
+    }
+
+    #[tokio::test]
+    async fn configured_right_click_passthrough_forwards_gesture_outside_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
@@ -2040,11 +2196,11 @@ mod tests {
         });
         app.handle_mouse(MouseEvent {
             modifiers: KeyModifiers::CONTROL,
-            ..mouse(MouseEventKind::Drag(MouseButton::Right), col + 1, row + 1)
+            ..mouse(MouseEventKind::Drag(MouseButton::Right), 0, 0)
         });
         app.handle_mouse(MouseEvent {
             modifiers: KeyModifiers::CONTROL,
-            ..mouse(MouseEventKind::Up(MouseButton::Right), col + 1, row + 1)
+            ..mouse(MouseEventKind::Up(MouseButton::Right), 0, 0)
         });
 
         assert_eq!(app.state.mode, Mode::Terminal);
@@ -2056,13 +2212,52 @@ mod tests {
         );
         assert_eq!(
             input_rx.try_recv().expect("forwarded right mouse drag"),
-            Bytes::from_static(b"\x1b[<34;4;5M")
+            Bytes::from_static(b"\x1b[<34;1;1M")
         );
         assert_eq!(
             input_rx.try_recv().expect("forwarded right mouse up"),
-            Bytes::from_static(b"\x1b[<2;4;5m")
+            Bytes::from_static(b"\x1b[<2;1;1m")
         );
         assert!(input_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn captured_left_press_focuses_target_before_forwarding() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let source = ws.tabs[0].root_pane;
+        let target = ws.test_split(Direction::Horizontal);
+        ws.tabs[0].layout.focus_pane(source);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let info = app
+            .state
+            .pane_info_by_id(target)
+            .expect("target pane info")
+            .clone();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                0,
+                b"\x1b[?1002h\x1b[?1006h",
+                4,
+            );
+        app.state.insert_test_runtime(target, runtime);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            info.inner_rect.x + 1,
+            info.inner_rect.y + 1,
+        ));
+
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(target));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded captured left press"),
+            Bytes::from_static(b"\x1b[<0;2;2M")
+        );
     }
 
     #[tokio::test]
@@ -2145,7 +2340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mouse_dispatcher_downgrades_sgr_pixel_motion_to_cell_coordinates() {
+    async fn ordinary_cell_mouse_downgrades_pixel_mode_to_cell_coordinates() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
@@ -2163,8 +2358,16 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
+        app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
         let info = app.state.view.pane_infos[0].clone();
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .unwrap()
+            .resize(info.inner_rect.height, info.inner_rect.width, 10, 20);
         assert!(info.inner_rect.x > 0, "sidebar offset should be present");
         assert!(info.inner_rect.y > 0, "tab bar offset should be present");
 
@@ -2179,6 +2382,77 @@ mod tests {
             Bytes::from_static(b"\x1b[<35;3;4M")
         );
         assert!(input_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dedicated_client_pixel_mouse_preserves_subcell_position() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                18,
+                0,
+                b"\x1b[?1003h\x1b[?1006h\x1b[?1016h",
+                4,
+            );
+        ws.insert_test_runtime(pane_id, runtime);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.mouse_capture = false;
+        app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let inner = app.state.view.pane_infos[0].inner_rect;
+        let geometry = crate::input::mouse::HostGeometry::new(106, 20, 1_060, 400).unwrap();
+        let x = u32::from(inner.x + 2) * 10 + 8;
+        let y = u32::from(inner.y + 3) * 20 + 9;
+        let report = format!("\x1b[<35;{x};{y}M");
+        app.state.host_mouse_pixels = Some(crate::input::mouse::HostPixels { x, y, geometry });
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .unwrap();
+        assert_eq!(runtime.pixel_size(), None);
+        assert_eq!(
+            app.state.pane_mouse_position(
+                runtime,
+                inner,
+                mouse(MouseEventKind::Moved, inner.x + 2, inner.y + 3),
+            ),
+            Some(crate::input::mouse::Position::Cell { column: 2, row: 3 })
+        );
+        runtime.resize(inner.height, inner.width, 10, 20);
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .unwrap();
+        assert_eq!(
+            runtime.pixel_size(),
+            Some((u32::from(inner.width) * 10, u32::from(inner.height) * 20))
+        );
+        assert_eq!(
+            app.state.pane_mouse_position(
+                runtime,
+                inner,
+                mouse(MouseEventKind::Moved, inner.x + 2, inner.y + 3),
+            ),
+            Some(crate::input::mouse::Position::Pixels { x: 28, y: 69 })
+        );
+        app.state.host_mouse_pixels = None;
+
+        assert!(app.route_client_pixel_mouse(7, report.as_bytes(), geometry));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded exact mouse motion"),
+            Bytes::from_static(b"\x1b[<35;28;69M")
+        );
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.state.host_mouse_pixels.is_none());
     }
 
     #[tokio::test]
@@ -2336,6 +2610,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_right_click_keeps_focus_and_exposes_swap_for_reporting_pane() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let source = ws.tabs[0].root_pane;
+        let target = ws.test_split(Direction::Horizontal);
+        ws.tabs[0].layout.focus_pane(source);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 100, 20));
+        let target_info = app
+            .state
+            .pane_info_by_id(target)
+            .expect("target pane info")
+            .clone();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                target_info.inner_rect.width,
+                target_info.inner_rect.height,
+                0,
+                b"\x1b[?1002h\x1b[?1006h",
+                4,
+            );
+        app.state.insert_test_runtime(target, runtime);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            target_info.inner_rect.x,
+            target_info.inner_rect.y,
+        ));
+
+        assert!(input_rx.try_recv().is_err());
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(source));
+        let menu = app.state.context_menu.as_mut().expect("pane context menu");
+        assert!(matches!(
+            menu.kind,
+            ContextMenuKind::Pane {
+                pane_id,
+                source_pane_id: Some(source_pane_id),
+                ..
+            } if pane_id == target && source_pane_id == source
+        ));
+        assert!(menu.items().contains(&"Swap with focused pane"));
+    }
+
+    #[tokio::test]
     async fn right_click_passthrough_requires_exact_modifier_match() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
@@ -2357,6 +2677,7 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.view.pane_infos = pane_infos;
+
         app.state.right_click_passthrough_modifiers = Some(KeyModifiers::CONTROL);
 
         let col = info.inner_rect.x + 2;
@@ -2826,6 +3147,7 @@ mod tests {
             80,
             app.state.pane_scrollback_limit_bytes,
             app.state.host_terminal_theme,
+            app.state.host_terminal_appearance,
             crate::pane::PaneShellConfig::new(&app.state.default_shell, app.state.shell_mode),
             app.event_tx.clone(),
             app.render_notify.clone(),
@@ -2846,6 +3168,7 @@ mod tests {
                 pane_id,
                 source_pane_id: None,
                 has_manual_label: false,
+                right_click_passthrough: false,
             },
             x: 2,
             y: 2,
@@ -3254,6 +3577,7 @@ mod tests {
             mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Sgr,
             mouse_alternate_scroll: true,
             modify_other_keys: false,
+            color_scheme_reporting: false,
         };
 
         assert_eq!(wheel_routing(input_state), WheelRouting::MouseReport);
@@ -3288,6 +3612,63 @@ mod tests {
             tab_bar.y,
         ));
         assert_eq!(app.state.workspaces[0].active_tab, 0);
+    }
+
+    #[test]
+    fn bottom_mode_bar_consumes_hidden_tab_mouse_actions() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        ws.test_add_tab(Some("two"));
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Prefix;
+        app.state.tab_bar_position = crate::config::TabBarPositionConfig::Bottom;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let second_tab = app.state.view.tab_hit_areas[1];
+        let new_tab = app.state.view.new_tab_hit_area;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second_tab.x,
+            second_tab.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            second_tab.x,
+            second_tab.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollDown,
+            second_tab.x,
+            second_tab.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            second_tab.x,
+            second_tab.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            new_tab.x,
+            new_tab.y,
+        ));
+
+        app.state.drag = Some(DragState {
+            target: DragTarget::SidebarDivider,
+        });
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            second_tab.x,
+            second_tab.y,
+        ));
+
+        assert_eq!(app.state.workspaces[0].active_tab, 0);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert!(app.state.context_menu.is_none());
+        assert!(app.state.tab_press.is_none());
+        assert!(app.state.drag.is_none());
     }
 
     #[test]
@@ -3873,6 +4254,7 @@ mod tests {
             mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
             mouse_alternate_scroll: true,
             modify_other_keys: false,
+            color_scheme_reporting: false,
         };
 
         assert_eq!(wheel_routing(input_state), WheelRouting::AlternateScroll);
@@ -3889,6 +4271,7 @@ mod tests {
             mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
             mouse_alternate_scroll: true,
             modify_other_keys: false,
+            color_scheme_reporting: false,
         };
 
         assert_eq!(wheel_routing(input_state), WheelRouting::HostScroll);

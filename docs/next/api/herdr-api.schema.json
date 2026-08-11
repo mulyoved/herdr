@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 17,
+  "protocol": 20,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -200,6 +200,38 @@
                 "type",
                 "workspace_id",
                 "insert_index",
+                "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "before_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "workspace_reordered",
+                  "type": "string"
+                },
+                "workspace_ids": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "workspaces": {
+                  "items": {
+                    "$ref": "#/schemas/event/$defs/WorkspaceInfo"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_ids",
                 "workspaces"
               ],
               "type": "object"
@@ -597,8 +629,21 @@
                     "null"
                   ]
                 },
+                "final_status": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/event/$defs/AgentStatus"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
+                },
+                "released": {
+                  "type": "boolean"
                 },
                 "type": {
                   "const": "pane_agent_detected",
@@ -689,6 +734,7 @@
             "workspace_closed",
             "workspace_renamed",
             "workspace_moved",
+            "workspace_reordered",
             "workspace_focused",
             "worktree_created",
             "worktree_opened",
@@ -1183,12 +1229,41 @@
             },
             "text": {
               "type": "string"
+            },
+            "wait": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentPromptWaitOptions"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
             "target",
             "text"
           ],
+          "type": "object"
+        },
+        "AgentPromptWaitOptions": {
+          "properties": {
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "until": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/AgentStatus"
+              },
+              "type": "array"
+            }
+          },
           "type": "object"
         },
         "AgentReadParams": {
@@ -1239,18 +1314,21 @@
           ],
           "type": "object"
         },
-        "AgentSendParams": {
+        "AgentSendKeysParams": {
           "properties": {
-            "target": {
-              "type": "string"
+            "keys": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
-            "text": {
+            "target": {
               "type": "string"
             }
           },
           "required": [
             "target",
-            "text"
+            "keys"
           ],
           "type": "object"
         },
@@ -1302,6 +1380,308 @@
           "properties": {
             "target": {
               "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "AgentViewBuiltinField": {
+          "enum": [
+            "status",
+            "workspace_id",
+            "tab_id",
+            "pane_id",
+            "agent",
+            "seen",
+            "state_change_seq"
+          ],
+          "type": "string"
+        },
+        "AgentViewBuiltinSortField": {
+          "enum": [
+            "workspace_order",
+            "tab_order",
+            "pane_order",
+            "attention",
+            "status",
+            "agent",
+            "seen",
+            "state_change_seq"
+          ],
+          "type": "string"
+        },
+        "AgentViewClearParams": {
+          "properties": {
+            "source": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "AgentViewContext": {
+          "enum": [
+            "current_workspace_id",
+            "current_tab_id"
+          ],
+          "type": "string"
+        },
+        "AgentViewField": {
+          "anyOf": [
+            {
+              "$ref": "#/schemas/request/$defs/AgentViewBuiltinField"
+            },
+            {
+              "properties": {
+                "token": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "token"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentViewFilter": {
+          "oneOf": [
+            {
+              "properties": {
+                "filters": {
+                  "items": {
+                    "$ref": "#/schemas/request/$defs/AgentViewFilter"
+                  },
+                  "type": "array"
+                },
+                "op": {
+                  "const": "all",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "filters"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "filters": {
+                  "items": {
+                    "$ref": "#/schemas/request/$defs/AgentViewFilter"
+                  },
+                  "type": "array"
+                },
+                "op": {
+                  "const": "any",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "filters"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "filter": {
+                  "$ref": "#/schemas/request/$defs/AgentViewFilter"
+                },
+                "op": {
+                  "const": "not",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "filter"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "field": {
+                  "$ref": "#/schemas/request/$defs/AgentViewField"
+                },
+                "op": {
+                  "const": "eq",
+                  "type": "string"
+                },
+                "value": {
+                  "$ref": "#/schemas/request/$defs/AgentViewValue"
+                }
+              },
+              "required": [
+                "op",
+                "field",
+                "value"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "field": {
+                  "$ref": "#/schemas/request/$defs/AgentViewField"
+                },
+                "op": {
+                  "const": "in",
+                  "type": "string"
+                },
+                "values": {
+                  "items": {
+                    "$ref": "#/schemas/request/$defs/AgentViewValue"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "op",
+                "field",
+                "values"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "field": {
+                  "$ref": "#/schemas/request/$defs/AgentViewField"
+                },
+                "op": {
+                  "const": "exists",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "field"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentViewSetParams": {
+          "properties": {
+            "filter": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentViewFilter"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sort": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/AgentViewSort"
+              },
+              "type": "array"
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source"
+          ],
+          "type": "object"
+        },
+        "AgentViewSort": {
+          "properties": {
+            "field": {
+              "$ref": "#/schemas/request/$defs/AgentViewSortField"
+            },
+            "order": {
+              "$ref": "#/schemas/request/$defs/AgentViewSortOrder",
+              "default": "asc"
+            }
+          },
+          "required": [
+            "field"
+          ],
+          "type": "object"
+        },
+        "AgentViewSortField": {
+          "anyOf": [
+            {
+              "$ref": "#/schemas/request/$defs/AgentViewBuiltinSortField"
+            },
+            {
+              "properties": {
+                "token": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "token"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentViewSortOrder": {
+          "enum": [
+            "asc",
+            "desc"
+          ],
+          "type": "string"
+        },
+        "AgentViewValue": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "properties": {
+                "context": {
+                  "$ref": "#/schemas/request/$defs/AgentViewContext"
+                }
+              },
+              "required": [
+                "context"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentWaitParams": {
+          "properties": {
+            "target": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "until": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/AgentStatus"
+              },
+              "type": "array"
             }
           },
           "required": [
@@ -1738,7 +2118,9 @@
             "hermes",
             "qodercli",
             "cursor",
-            "mastracode"
+            "mastracode",
+            "antigravity_cli",
+            "grok"
           ],
           "type": "string"
         },
@@ -2070,6 +2452,12 @@
         },
         "PaneGraphicsClearParams": {
           "properties": {
+            "layer_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
             }
@@ -2083,7 +2471,8 @@
           "enum": [
             "png",
             "rgb",
-            "rgba"
+            "rgba",
+            "bgra"
           ],
           "type": "string"
         },
@@ -2133,6 +2522,12 @@
               "minimum": 0,
               "type": "integer"
             },
+            "layer_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
             },
@@ -2144,6 +2539,11 @@
                 "viewport_col": 0,
                 "viewport_row": 0
               }
+            },
+            "z_index": {
+              "default": 0,
+              "format": "int32",
+              "type": "integer"
             }
           },
           "required": [
@@ -2151,6 +2551,21 @@
             "format",
             "image_width",
             "image_height"
+          ],
+          "type": "object"
+        },
+        "PaneInputSetParams": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "right_click": {
+              "$ref": "#/schemas/request/$defs/PaneRightClickTarget"
+            }
+          },
+          "required": [
+            "pane_id",
+            "right_click"
           ],
           "type": "object"
         },
@@ -2588,6 +3003,13 @@
           ],
           "type": "object"
         },
+        "PaneRightClickTarget": {
+          "enum": [
+            "herdr",
+            "pane"
+          ],
+          "type": "string"
+        },
         "PaneSendInputParams": {
           "properties": {
             "keys": {
@@ -2668,6 +3090,10 @@
                 "number",
                 "null"
               ]
+            },
+            "right_click": {
+              "$ref": "#/schemas/request/$defs/PaneRightClickTarget",
+              "default": "herdr"
             },
             "target_pane_id": {
               "type": [
@@ -3317,6 +3743,18 @@
             {
               "properties": {
                 "type": {
+                  "const": "workspace.reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
                   "const": "workspace.closed",
                   "type": "string"
                 }
@@ -3731,6 +4169,26 @@
               ]
             }
           },
+          "type": "object"
+        },
+        "WorkspaceMoveBlockParams": {
+          "properties": {
+            "before_workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "workspace_ids"
+          ],
           "type": "object"
         },
         "WorkspaceMoveParams": {
@@ -4227,6 +4685,22 @@
         {
           "properties": {
             "method": {
+              "const": "workspace.move_block",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceMoveBlockParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "workspace.report_metadata",
               "type": "string"
             },
@@ -4499,11 +4973,11 @@
         {
           "properties": {
             "method": {
-              "const": "agent.send",
+              "const": "agent.send_keys",
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/AgentSendParams"
+              "$ref": "#/schemas/request/$defs/AgentSendKeysParams"
             }
           },
           "required": [
@@ -4520,6 +4994,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentRenameParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.view.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentViewSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.view.clear",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentViewClearParams"
             }
           },
           "required": [
@@ -4568,6 +5074,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.wait",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentWaitParams"
             }
           },
           "required": [
@@ -4840,6 +5362,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.input.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneInputSetParams"
             }
           },
           "required": [
@@ -5941,6 +6479,38 @@
             },
             {
               "properties": {
+                "before_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "workspace_reordered",
+                  "type": "string"
+                },
+                "workspace_ids": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "workspaces": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/WorkspaceInfo"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_ids",
+                "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "type": {
                   "const": "workspace_focused",
                   "type": "string"
@@ -6332,8 +6902,21 @@
                     "null"
                   ]
                 },
+                "final_status": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AgentStatus"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
+                },
+                "released": {
+                  "type": "boolean"
                 },
                 "type": {
                   "const": "pane_agent_detected",
@@ -6439,6 +7022,7 @@
             "workspace_closed",
             "workspace_renamed",
             "workspace_moved",
+            "workspace_reordered",
             "workspace_focused",
             "worktree_created",
             "worktree_opened",
@@ -6533,6 +7117,12 @@
                 "kind": "local"
               }
             },
+            "startup": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginManifestStartup"
+              },
+              "type": "array"
+            },
             "version": {
               "type": "string"
             },
@@ -6583,7 +7173,9 @@
             "hermes",
             "qodercli",
             "cursor",
-            "mastracode"
+            "mastracode",
+            "antigravity_cli",
+            "grok"
           ],
           "type": "string"
         },
@@ -7876,6 +8468,29 @@
           ],
           "type": "object"
         },
+        "PluginManifestStartup": {
+          "properties": {
+            "command": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "platforms": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginPlatform"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
         "PluginPaneInfo": {
           "properties": {
             "entrypoint": {
@@ -8320,11 +8935,6 @@
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
                 },
-                "baseline_state_change_seq": {
-                  "format": "uint64",
-                  "minimum": 0,
-                  "type": "integer"
-                },
                 "type": {
                   "const": "agent_prompted",
                   "type": "string"
@@ -8332,8 +8942,7 @@
               },
               "required": [
                 "type",
-                "agent",
-                "baseline_state_change_seq"
+                "agent"
               ],
               "type": "object"
             },
@@ -8353,6 +8962,34 @@
               "required": [
                 "type",
                 "agents"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "active": {
+                  "type": "boolean"
+                },
+                "label": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "agent_view",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "active"
               ],
               "type": "object"
             },
@@ -8617,6 +9254,30 @@
             },
             {
               "properties": {
+                "revision": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "sequence": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "pane_graphics_frame_ack",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "sequence",
+                "revision"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "cell_height_px": {
                   "format": "uint32",
                   "minimum": 0,
@@ -8627,6 +9288,51 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "file_frame_damage": {
+                  "default": false,
+                  "description": "Accepts damage metadata while still consuming a complete canonical file.",
+                  "type": "boolean"
+                },
+                "file_frame_directory": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "file_frame_formats": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "file_frame_max_bytes": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "file_frame_transport": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "max_layers_per_pane": {
+                  "default": 0,
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pane_visible": {
+                  "description": "True only when this pane is on the currently rendered terminal surface.",
+                  "type": "boolean"
+                },
+                "pixel_mouse": {
+                  "default": false,
+                  "type": "boolean"
+                },
                 "type": {
                   "const": "pane_graphics_info",
                   "type": "string"
@@ -8635,7 +9341,8 @@
               "required": [
                 "type",
                 "cell_width_px",
-                "cell_height_px"
+                "cell_height_px",
+                "pane_visible"
               ],
               "type": "object"
             },
