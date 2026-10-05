@@ -81,3 +81,13 @@ fn client_url_handler_timeout_kills_only_owned_child_and_client_stays_responsive
         f.messages.recv_timeout(Duration::from_millis(50)).is_err() || !f.invocations().is_empty()
     );
 }
+
+#[test]
+fn client_url_handler_releases_completed_identities_beyond_queue_capacity() {
+    let f = HandlerFixture::start(json!({}));
+    for n in 0..40 {
+        f.submit(&format!("success-{n}"), 20_000);
+        assert_eq!(f.completion()["result"]["ok"], true);
+    }
+    assert_eq!(f.invocations().len(), 40);
+}

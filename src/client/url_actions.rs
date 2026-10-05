@@ -69,7 +69,6 @@ impl UrlActionDispatcher {
         let (queue, received) = mpsc::sync_channel::<Accepted>(32);
         let inflight = Arc::new(Mutex::new(HashSet::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let pending = inflight.clone();
         let cancelled = stop.clone();
         let tx = events.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -84,17 +83,12 @@ impl UrlActionDispatcher {
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(_) => break,
                     };
-                    let identity = accepted.identity();
                     let result = runtime.block_on(run_handler(&accepted, &cancelled));
-                    // Retain identity until completion is queued, so duplicate controls cannot launch again.
+                    // The client loop releases identity after processing completion; queued duplicates remain suppressed.
                     runtime.block_on(async {
                         let event = accepted.event(result);
                         tokio::select! { _=tx.send(event)=>{}, _=wait_cancelled(&cancelled)=>{} }
                     });
-                    pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&identity);
                 }
             })?;
         Ok(Self {
@@ -145,6 +139,22 @@ impl UrlActionDispatcher {
                 .events
                 .try_send(accepted.event(failure(HostUrlErrorCode::HandlerFailed)));
         }
+    }
+    pub(super) fn completed(
+        &self,
+        endpoint_id: &ClientEndpointId,
+        generation: u64,
+        completion: &OpenUrlCompletion,
+    ) {
+        self.inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(
+                endpoint_id.clone(),
+                generation,
+                completion.boot_id.clone(),
+                completion.request_id.clone(),
+            ));
     }
 }
 impl Drop for UrlActionDispatcher {
@@ -240,4 +250,65 @@ async fn run_handler(accepted: &Accepted, stop: &AtomicBool) -> HostUrlResult {
         return failure(HostUrlErrorCode::InvalidResult);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Real process with a paused completion consumer: PTY E2Es cannot deterministically
+    // order a duplicate already queued in the UI before the worker's completion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_completion_retains_inflight_duplicate_protection() {
+        let root = std::env::temp_dir().join(format!("herdr-url-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let events = root.join("invocations.txt");
+        std::fs::write(&events, "").unwrap();
+        let script = root.join("handler.py");
+        std::fs::write(&script, "import sys,json\njson.loads(sys.stdin.readline())\nwith open(sys.argv[1],'a') as f:f.write('called\\n')\nprint(json.dumps({'schemaVersion':1,'ok':True,'outcome':'opened'}))\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let dispatcher = UrlActionDispatcher::new(tx).unwrap();
+        let request = OpenUrlControl {
+            request_id: "same".into(),
+            boot_id: "boot".into(),
+            remaining_ms: 20_000,
+            action: crate::client_url::OpenUrlAction {
+                schema_version: 1,
+                action: "open-url".into(),
+                url: "https://example.com/".into(),
+                key: None,
+            },
+        };
+        let argv = vec![
+            "/usr/bin/python3".into(),
+            script.to_string_lossy().into_owned(),
+            events.to_string_lossy().into_owned(),
+        ];
+        dispatcher.enqueue(
+            ClientEndpointId::Local,
+            1,
+            request.clone(),
+            argv.clone(),
+            Instant::now(),
+        );
+        let _completion = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Hold this event unprocessed while dispatching the duplicate that preceded it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        dispatcher.enqueue(ClientEndpointId::Local, 1, request, argv, Instant::now());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "duplicate launched before completion was processed"
+        );
+        assert_eq!(std::fs::read_to_string(&events).unwrap().lines().count(), 1);
+        std::fs::write(
+            root.join("replay.txt"),
+            "just test-one queued_completion_retains_inflight_duplicate_protection\n",
+        )
+        .unwrap();
+    }
 }

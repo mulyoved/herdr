@@ -1404,6 +1404,7 @@ async fn run_client_loop(
                         );
                     }
                 }
+                url_dispatcher.completed(&endpoint_id, generation, &completion);
             }
             ClientLoopEvent::ServerMessage {
                 endpoint_id,
