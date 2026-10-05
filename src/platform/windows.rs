@@ -3113,6 +3113,11 @@ impl Drop for InputSourceRestore {
     }
 }
 
+pub(crate) fn command_is_executable(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -5127,8 +5132,4 @@ mod tests {
             );
         }
     }
-}
-pub(crate) fn command_is_executable(path: &std::path::Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
 }

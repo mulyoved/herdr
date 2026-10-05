@@ -252,12 +252,11 @@ async fn run_handler(accepted: &Accepted, stop: &AtomicBool) -> HostUrlResult {
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     // Real process with a paused completion consumer: PTY E2Es cannot deterministically
     // order a duplicate already queued in the UI before the worker's completion.
-    #[cfg(unix)]
     #[tokio::test]
     async fn queued_completion_retains_inflight_duplicate_protection() {
         let root = std::env::temp_dir().join(format!("herdr-url-dedup-{}", std::process::id()));

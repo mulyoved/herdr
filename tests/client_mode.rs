@@ -2351,13 +2351,23 @@ fn client_url_handler_finishes_on_original_endpoint_after_real_machine_switch() 
     let pending = thread::spawn(move || {
         send_json_request(&socket,&serde_json::json!({"id":"open","method":"client.open_url","params":{"url":"https://example.com/","client":id}}).to_string())
     });
-    assert!(
-        wait_until(Duration::from_secs(5), Duration::from_millis(10), || base
-            .join("handler-events.jsonl")
-            .exists()),
-        "handler missing: {}",
-        base.display()
-    );
+    if !wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        base.join("handler-events.jsonl").exists()
+    }) {
+        let response = pending.is_finished().then(|| pending.join().unwrap());
+        let clients = send_json_request(
+            &api,
+            "{\"id\":\"clients\",\"method\":\"client.list\",\"params\":{}}",
+        );
+        let observed = serde_json::json!({"response":response,"clients":clients});
+        fs::write(base.join("observed.json"), observed.to_string()).unwrap();
+        fs::write(base.join("client.pty"), read_output(&output)).unwrap();
+        panic!(
+            "handler missing: {}; observed={observed}; screen={}",
+            base.display(),
+            screen()
+        );
+    }
     let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
     input
         .write_all(&sidebar_row_click(&screen(), "URL Remote"))
