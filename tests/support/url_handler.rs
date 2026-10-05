@@ -131,7 +131,12 @@ impl HandlerFixture {
                     .as_array()
                     .is_some_and(|c| !c.is_empty())
             }),
-            "client bootstrap missing"
+            "client bootstrap missing: {}; server={}; client={}; controls={}",
+            fixture.server.artifact_dir.display(),
+            fs::read_to_string(fixture.server.artifact_dir.join("server.log")).unwrap_or_default(),
+            fs::read_to_string(fixture.server.artifact_dir.join("client.log")).unwrap_or_default(),
+            fs::read_to_string(fixture.server.artifact_dir.join("client-controls.jsonl"))
+                .unwrap_or_default()
         );
         // Snapshot publication precedes URL injection; let the client process the bootstrap.
         thread::sleep(Duration::from_millis(150));
