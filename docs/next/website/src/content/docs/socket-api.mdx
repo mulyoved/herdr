@@ -954,3 +954,13 @@ The numbered binary protocol remains for same-install and internal operations,
 including direct terminal attach and live handoff. Check `ping` or `herdr status`
 before using those operations across different builds. JSON API clients should
 ignore unknown fields and handle unsupported methods as normal errors.
+
+
+## Client URL API
+
+`client.list` takes `{}` and returns `type: "client_list"` plus `clients`, each with `client_id`, `foreground`, `platform`, and `open_url`. `client.open_url` takes `url` plus optional `key` and `client`. Absent client selects foreground; `foreground` explicitly selects it; opaque IDs pin a current connection. Keys match `[A-Za-z0-9._-]{1,128}`. HTTP(S) URLs require a hostname and reject userinfo/control characters. Serialized action JSON including newline is at most 4096 bytes. Outcomes are `opened` or `focused`; success requires the host handler acknowledgement. Error codes include `invalid_url`, `no_foreground_client`, `client_unavailable`, `client_unsupported`, `overloaded`, `handler_failed`, and `indeterminate_delivery`. Requests are bounded to four per client and 32 per server; server deadline is 20 seconds. A lost acknowledgement after delivery is indeterminate and never retried or retargeted.
+
+```json
+{"id":"open-1","method":"client.open_url","params":{"url":"https://example.com/","key":"project","client":"foreground"}}
+{"id":"open-1","result":{"type":"client_open_url","client_id":"opaque-current-id","outcome":"opened"}}
+```

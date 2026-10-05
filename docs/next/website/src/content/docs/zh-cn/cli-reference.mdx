@@ -502,3 +502,14 @@ herdr plugin pane close <pane_id>
 | `HERDR_WORKSPACE_ID` | 运行中窗格进程的公开工作区 id。 |
 | `HERDR_LOG` | 设置日志过滤,例如 `HERDR_LOG=herdr=debug`。 |
 | `HERDR_DISABLE_SOUND` | 即使启用了声音通知也禁用声音播放。 |
+
+
+## 客户端 URL 命令
+
+`client list` 返回当前客户端 ID、前台状态、平台和 `open_url` 支持状态。目标依次由 `--client`、`HERDR_ORIGIN_CLIENT_ID`、接收时的前台客户端决定。无效或已断开的 ID 不会回退到其他客户端。全局 `--session` 和套接字选择仍然适用。无参数的 `herdr client` 保持原有连接行为。CLI 等待期限为25秒，不自动重试。
+
+```bash
+herdr client list --json
+herdr client open-url https://example.com/ --json
+herdr client open-url https://example.com/ --key project --client foreground --json
+```

@@ -606,3 +606,13 @@ switch_ascii_input_source_in_prefix = true
 ```
 
 日志会自动轮转。报告问题时，请附上当前日志和轮转后的同级日志文件。
+
+
+## 本地客户端 URL 处理程序
+
+`client.open_url_command` 是本地 argv 数组，默认 `[]` 禁用此功能。可执行文件必须是本地可执行的绝对路径。macOS 使用 mdev，Windows 使用 mdev.exe，Linux 可配置自定义处理程序。即使通过 `--remote` 启动也应在桌面机器上配置。已接受请求保存 argv 副本；后续请求和重新连接使用当前设置。
+
+```toml
+[client]
+open_url_command = ["/absolute/path/to/mdev", "host", "focus-or-open", "--kind", "open-url", "--cdp-only", "--json"]
+```

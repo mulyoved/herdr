@@ -372,3 +372,14 @@ manifests at the root or in subdirectories of the repository's default branch.
 One repository card can contain multiple separately installable plugins. The
 index refreshes every 30 minutes. See
 [Marketplace](/docs/marketplace/) for how discovery works.
+
+
+## Invoking client provenance
+
+Endpoint `command.invoke` stamps optional plugin context `origin_client_id` from the authenticated invoking connection, after merging supplied context. Plugin commands inherit server-issued `HERDR_ORIGIN_CLIENT_ID`; ordinary API invocations clear supplied/inherited origin. Delayed actions keep the original host even after focus changes. Popup/picker launchers must explicitly pass that environment value into their per-popup process. Ordinary agent terminals have no permanent desktop origin, so CLI requests use current foreground unless explicitly targeted.
+
+```bash
+herdr client list --json
+herdr client open-url https://example.com/ --json
+herdr client open-url https://example.com/ --key project --client foreground --json
+```

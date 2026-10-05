@@ -606,3 +606,13 @@ Windows でのサポートは現時点で韓国語 IME に限定されていま�
 ```
 
 ログは自動的にローテーションされます。問題を報告するときは、現在のログとローテーションされた関連ファイルを含めてください。
+
+
+## ローカルクライアントの URL ハンドラー
+
+`client.open_url_command` はローカルの argv 配列です。既定の `[]` は機能を無効にします。実行ファイルはローカルの実行可能な絶対パスで指定します。macOS は mdev、Windows は mdev.exe、Linux は任意の対応ハンドラーを設定します。`--remote` 起動時もデスクトップ側の設定です。受理済みの要求は argv のコピーを保持し、後続の要求と再接続は現在の設定を使います。
+
+```toml
+[client]
+open_url_command = ["/absolute/path/to/mdev", "host", "focus-or-open", "--kind", "open-url", "--cdp-only", "--json"]
+```

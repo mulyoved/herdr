@@ -149,3 +149,14 @@ herdr terminal session control w1:p1 --takeover --cols 120 --rows 40
 ```
 
 同じフレームを出力し、標準入力から改行区切り JSON コマンドを読み取ります。`terminal.input` はテキストまたは base64 データ、`terminal.resize` は表示サイズ、`terminal.scroll` はビューポートのスクロール、`terminal.mouse` はマウス報告を有効にしたアプリへのセル位置のマウスイベント、`terminal.release` はコントローラーの終了を扱います。入力とリサイズを所有できるコントローラーは 1 つだけです。
+
+
+## クライアントホストで URL を開く
+
+`herdr --remote <ssh-target> --remote-keybindings server` の起動前にローカルの `[client].open_url_command` を設定します。既存のホストから VM への双方向 SSH 接続を使うため、逆方向の SSH や2本目の接続は不要です。VM のコマンドは既存のサーバーソケットを使います。古いクライアントは URL 操作だけを無効にします。URL の `localhost` は対象のデスクトップを指し、VM サービス用トンネルは作成しません。ホストの期限は15秒で、Chrome/CDP の準備・作成・移動・アクティブ化の確認を必要とします。既定ブラウザーへのフォールバックは無効です。OS のウィンドウフォーカスはベストエフォートで、応答消失は `indeterminate_delivery` です。
+
+```bash
+herdr client list --json
+herdr client open-url https://example.com/ --json
+herdr client open-url https://example.com/ --key project --client foreground --json
+```

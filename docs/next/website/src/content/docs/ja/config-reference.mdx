@@ -25,3 +25,13 @@ herdr --default-config
   noMatches="一致するキーはありません。"
   keyCountLabel="キー"
 />
+
+
+## URL ハンドラーの設定
+
+`client.open_url_command` の既定値は `[]` です。ローカルのコマンドは標準入力から1件の JSON アクションを読み、標準出力へ構造化した結果を返します。設定はクライアントを起動するマシンに置きます。
+
+```toml
+[client]
+open_url_command = ["/absolute/path/to/mdev", "host", "focus-or-open", "--kind", "open-url", "--cdp-only", "--json"]
+```

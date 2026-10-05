@@ -19,3 +19,13 @@ listed per key here; see
 [Custom command keybindings](/docs/configuration/#custom-command-keybindings).
 
 <ConfigReference />
+
+
+## Client URL handler setting
+
+`client.open_url_command` defaults to `[]`. A configured local command reads one bounded action JSON record on stdin and writes one structured result. This setting belongs to the machine launching the client.
+
+```toml
+[client]
+open_url_command = ["/absolute/path/to/mdev", "host", "focus-or-open", "--kind", "open-url", "--cdp-only", "--json"]
+```

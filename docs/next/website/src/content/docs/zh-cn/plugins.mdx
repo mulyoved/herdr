@@ -328,3 +328,14 @@ v1 没有 Herdr 管理的插件存储 API。需要持久状态的插件应自己
 根目录或子目录放置清单。一张仓库卡片可以包含多个插件。索引每 30 分钟刷新一次。
 发现机制的工作方式见
 [插件市场](/zh-cn/docs/marketplace/)。
+
+
+## 调用客户端来源
+
+端点 `command.invoke` 根据已验证的调用连接设置 `origin_client_id`，通过 `HERDR_ORIGIN_CLIENT_ID` 传给插件。提供的上下文不能覆盖该值，普通 API 调用会清除它。延迟操作仍固定原来的主机。弹出窗口应将该环境变量明确传入自身进程。普通代理终端不保存永久的桌面身份。
+
+```bash
+herdr client list --json
+herdr client open-url https://example.com/ --json
+herdr client open-url https://example.com/ --key project --client foreground --json
+```

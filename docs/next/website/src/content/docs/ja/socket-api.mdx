@@ -767,3 +767,13 @@ herdr agent wait w1:p1 --until blocked
 クライアント描画の Herdr UI は、ローカルサーバーと SSH サーバーに安定したエンドポイント世代を使います。クライアントとサーバーのビルドが一致する必要はありません。接続時にコアのスナップショット、画面、入力、blob コーデックを合意し、サーバーが対応 API メソッドと任意の能力を通知します。保存済み SSH マシンには、選択中のマシンだけがペイン画面を送信するための `surface_interest` と、通信のない接続の障害を検知する `health_check` が必要です。未対応のサーバーは明示的に更新するまで Attention になります。詳しくは[マシンへの接続](/ja/docs/connecting-machines/)を参照してください。メソッドがない場合は、そのサーバー上の該当アクションだけを無効にしてクライアント側通知を表示します。拒否やタイムアウトも接続を終了せず通知します。エンドポイント世代 1 より前のサーバーだけは最後の 1 回の更新が必要です。
 
 番号付きバイナリプロトコルは、直接ターミナル接続やライブハンドオフなど、同一インストール内の内部操作に残ります。異なるビルド間でそれらを使う前に `ping` または `herdr status` を確認してください。JSON API クライアントは未知のフィールドを無視し、未対応メソッドを通常のエラーとして扱う必要があります。
+
+
+## クライアント URL API
+
+`client.list` は `{}` を受け取り、`type: "client_list"` と `clients` を返します。各要素は `client_id`、`foreground`、`platform`、`open_url` を含みます。`client.open_url` は `url` と任意の `key`、`client` を受け取ります。対象省略はフォアグラウンド、`foreground` は明示的な指定、ID は現在の接続に固定します。キーは `[A-Za-z0-9._-]{1,128}`、URL はホスト名のある HTTP(S) のみで、認証情報と制御文字を拒否します。JSON と改行は4096バイト以内です。結果は `opened` または `focused`。エラーは `invalid_url`、`no_foreground_client`、`client_unavailable`、`client_unsupported`、`overloaded`、`handler_failed`、`indeterminate_delivery` です。同時要求はクライアントごとに4件、サーバー全体で32件、期限は20秒です。配信後の応答消失は不確定として報告し、自動再試行や再選択はしません。
+
+```json
+{"id":"open-1","method":"client.open_url","params":{"url":"https://example.com/","key":"project","client":"foreground"}}
+{"id":"open-1","result":{"type":"client_open_url","client_id":"opaque-current-id","outcome":"opened"}}
+```

@@ -761,3 +761,13 @@ herdr agent wait w1:p1 --until blocked
 由客户端渲染的 Herdr UI 对本地和 SSH 服务器使用稳定的端点代数。客户端和服务器构建不必一致。连接时，双方会协商核心快照、屏幕、输入和 blob 编解码器，服务器则公布支持的 API 方法和可选能力。已保存的 SSH 机器需要 `surface_interest` 来确保只有选中的机器传输窗格画面，并需要 `health_check` 来发现空闲连接的故障。缺少这些能力的服务器会显示 Attention，直到明确更新。详见[连接机器](/zh-cn/docs/connecting-machines/)。缺少方法时,只禁用该服务器上的对应操作并显示客户端本地通知;操作被拒绝或超时也不会断开连接。只有早于端点第 1 代的服务器需要最后更新一次。
 
 带编号的二进制协议仍用于同一安装内的内部操作,包括直接终端连接和实时交接。跨不同构建使用这些操作前,请检查 `ping` 或 `herdr status`。JSON API 客户端应忽略未知字段,并把不支持的方法当作普通错误处理。
+
+
+## 客户端 URL API
+
+`client.list` 接受 `{}`，返回 `type: "client_list"` 和 `clients`，每项包含 `client_id`、`foreground`、`platform`、`open_url`。`client.open_url` 接受 `url` 和可选的 `key`、`client`。省略目标选择前台，`foreground` 明确选择前台，不透明 ID 固定当前连接。键匹配 `[A-Za-z0-9._-]{1,128}`；URL 仅支持具有主机名的 HTTP(S)，拒绝用户认证信息和控制字符。JSON 加换行最多4096字节。结果为 `opened` 或 `focused`。错误代码包括 `invalid_url`、`no_foreground_client`、`client_unavailable`、`client_unsupported`、`overloaded`、`handler_failed`、`indeterminate_delivery`。每个客户端最多4个请求，服务器最多32个，服务器期限为20秒。发送后丢失响应按不确定结果报告，不自动重试或重新选择。
+
+```json
+{"id":"open-1","method":"client.open_url","params":{"url":"https://example.com/","key":"project","client":"foreground"}}
+{"id":"open-1","result":{"type":"client_open_url","client_id":"opaque-current-id","outcome":"opened"}}
+```

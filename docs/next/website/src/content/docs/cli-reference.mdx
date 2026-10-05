@@ -569,3 +569,14 @@ These meanings apply to reads. For `pane wait-output` only, both `recent` and `r
 | `HERDR_WORKSPACE_ID` | Public workspace id for the running pane process. |
 | `HERDR_LOG` | Set log filter, for example `HERDR_LOG=herdr=debug`. |
 | `HERDR_DISABLE_SOUND` | Disable sound playback even when sound notifications are enabled. |
+
+
+## Client URL commands
+
+`client list` returns current opaque client IDs, foreground status, platform, and `open_url` support. `client open-url <url> [--key KEY] [--client ID|foreground] [--json]` opens HTTP(S) on the selected client host. Selection is explicit `--client`, then `HERDR_ORIGIN_CLIENT_ID`, then the foreground client at acceptance. An invalid/stale explicit or inherited ID fails without retargeting. Global `--session` and socket selection apply. Bare `herdr client` retains its internal attach behavior. The wait budget is 25 seconds, without automatic retry.
+
+```bash
+herdr client list --json
+herdr client open-url https://example.com/ --json
+herdr client open-url https://example.com/ --key project --client foreground --json
+```

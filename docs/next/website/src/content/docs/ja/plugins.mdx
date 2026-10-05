@@ -368,3 +368,14 @@ GitHub トピック `herdr-plugin` が付いており、必須メタデータを
 1 つのリポジトリカードに複数のプラグインを掲載できます。インデックスは 30 分ごとに
 更新されます。発見の仕組みは
 [マーケットプレイス](/ja/docs/marketplace/)を参照してください。
+
+
+## 呼び出し元クライアントの保持
+
+エンドポイントの `command.invoke` は認証済み接続から `origin_client_id` を付与し、プラグインへ `HERDR_ORIGIN_CLIENT_ID` を渡します。入力されたコンテキストで上書きできず、通常の API 呼び出しでは削除します。遅延処理でも元のホストを維持します。ポップアップはこの環境変数を個別に渡してください。通常のエージェント端末には固定のデスクトップ ID を保存しません。
+
+```bash
+herdr client list --json
+herdr client open-url https://example.com/ --json
+herdr client open-url https://example.com/ --key project --client foreground --json
+```

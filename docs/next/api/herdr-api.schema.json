@@ -1695,6 +1695,30 @@
           ],
           "type": "object"
         },
+        "ClientOpenUrlParams": {
+          "additionalProperties": false,
+          "properties": {
+            "client": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "key": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "type": "object"
+        },
         "ClientShellSurfaceSetParams": {
           "description": "Updates whether the requesting client shell receives and controls pane presentation.",
           "properties": {
@@ -3498,6 +3522,12 @@
                 "null"
               ]
             },
+            "origin_client_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "selected_text": {
               "type": [
                 "string",
@@ -4865,6 +4895,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/ClientWindowTitleSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "client.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "client.open_url",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ClientOpenUrlParams"
             }
           },
           "required": [
@@ -6775,6 +6837,29 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "ClientInfo": {
+          "properties": {
+            "client_id": {
+              "type": "string"
+            },
+            "foreground": {
+              "type": "boolean"
+            },
+            "open_url": {
+              "type": "boolean"
+            },
+            "platform": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "client_id",
+            "foreground",
+            "platform",
+            "open_url"
+          ],
+          "type": "object"
         },
         "ClientWindowTitleReason": {
           "enum": [
@@ -8779,6 +8864,12 @@
                 "null"
               ]
             },
+            "origin_client_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "selected_text": {
               "type": [
                 "string",
@@ -9167,6 +9258,45 @@
         },
         "ResponseResult": {
           "oneOf": [
+            {
+              "properties": {
+                "clients": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/ClientInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "client_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "clients"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "client_id": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "$ref": "#/schemas/success_response/$defs/UrlOutcome"
+                },
+                "type": {
+                  "const": "client_open_url",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "client_id",
+                "outcome"
+              ],
+              "type": "object"
+            },
             {
               "properties": {
                 "capabilities": {
@@ -10572,6 +10702,13 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "UrlOutcome": {
+          "enum": [
+            "opened",
+            "focused"
+          ],
+          "type": "string"
         },
         "WorkspaceInfo": {
           "properties": {

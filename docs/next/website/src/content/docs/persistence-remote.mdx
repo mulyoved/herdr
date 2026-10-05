@@ -158,3 +158,14 @@ base64 bytes, `terminal.resize` changes the controller viewport,
 `terminal.scroll` scrolls the attached viewport, `terminal.mouse` sends a mouse
 event at a cell to applications that enabled mouse reporting, and
 `terminal.release` closes the controller. Only one controller owns input and resize at a time.
+
+
+## Open URLs on the client host
+
+Configure `[client].open_url_command` locally before launching `herdr --remote <ssh-target> --remote-keybindings server`. Named optional URL controls travel over the existing bidirectional host-to-VM SSH connection; no VM-to-host SSH or second SSH connection is needed. Commands inside the VM address its existing server socket. Unsupported older clients disable this action while keeping their endpoint connection usable. `localhost` in a URL means the selected desktop; this action creates no VM service tunnel. The host handler has at most 15 seconds. It must acknowledge Chrome/CDP readiness, create/navigation, and activation; default-browser fallback is disabled. OS window focus is best effort. Lost results report `indeterminate_delivery`; inspect before manually retrying.
+
+```bash
+herdr client list --json
+herdr client open-url https://example.com/ --json
+herdr client open-url https://example.com/ --key project --client foreground --json
+```

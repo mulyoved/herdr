@@ -24,3 +24,13 @@ herdr --default-config
   noMatches="没有匹配的键。"
   keyCountLabel="个键"
 />
+
+
+## URL 处理程序配置
+
+`client.open_url_command` 默认为 `[]`。本地命令从标准输入读取一条有大小限制的 JSON 操作，并向标准输出写入结构化结果。设置属于启动客户端的机器。
+
+```toml
+[client]
+open_url_command = ["/absolute/path/to/mdev", "host", "focus-or-open", "--kind", "open-url", "--cdp-only", "--json"]
+```

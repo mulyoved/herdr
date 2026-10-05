@@ -613,3 +613,13 @@ Common log files:
 ```
 
 Logs rotate automatically. Include the current log and rotated siblings when reporting issues.
+
+
+## Local client URL handler
+
+`client.open_url_command` is a local argv array; its default `[]` disables URL support. The executable must be an absolute, executable local file. On macOS use the installed mdev path; on Windows use the local mdev.exe path, with TOML literal quotes for backslashes. Linux supports a configured custom handler. Configure the desktop client, including when launching with `--remote`; the remote server cannot supply an executable. Future requests load the current local setting; accepted queued requests keep their argv snapshot. Reconnection advertises the current capability.
+
+```toml
+[client]
+open_url_command = ["/absolute/path/to/mdev", "host", "focus-or-open", "--kind", "open-url", "--cdp-only", "--json"]
+```

@@ -502,3 +502,14 @@ herdr plugin pane close <pane_id>
 | `HERDR_WORKSPACE_ID` | 実行中ペインプロセスの公開ワークスペース id。 |
 | `HERDR_LOG` | ログフィルターを設定する。例: `HERDR_LOG=herdr=debug`。 |
 | `HERDR_DISABLE_SOUND` | サウンド通知が有効でも音の再生を無効にする。 |
+
+
+## クライアントの URL コマンド
+
+`client list` は現在のクライアント ID、フォアグラウンド状態、プラットフォーム、`open_url` 対応を返します。対象は `--client`、`HERDR_ORIGIN_CLIENT_ID`、受理時のフォアグラウンドの順です。無効・切断済みの ID では別のクライアントへ切り替えません。`--session` とソケット指定も適用されます。引数なしの `herdr client` は従来の接続動作を維持します。CLI の待機期限は25秒で、自動再試行はありません。
+
+```bash
+herdr client list --json
+herdr client open-url https://example.com/ --json
+herdr client open-url https://example.com/ --key project --client foreground --json
+```
