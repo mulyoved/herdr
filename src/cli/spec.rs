@@ -32,6 +32,7 @@ pub(super) fn command() -> Command {
         .subcommand(completion::command())
         .subcommand(update_command())
         .subcommand(status_command())
+        .subcommand(client_command())
         .subcommand(config_command())
         .subcommand(channel_command())
         .subcommand(machine::command())
@@ -131,6 +132,24 @@ fn status_command() -> Command {
         .subcommand(
             Command::new("client")
                 .about("Show local client status")
+                .arg(json_flag()),
+        )
+}
+
+fn client_command() -> Command {
+    Command::new("client")
+        .about("Discover attached clients and open URLs in their local CDP browser")
+        .subcommand(
+            Command::new("list")
+                .about("List attached clients and URL handler support")
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("open-url")
+                .about("Open or focus an HTTP(S) URL on one client")
+                .arg(required("url", "URL"))
+                .arg(option("key", "KEY"))
+                .arg(option("client", "ID|foreground"))
                 .arg(json_flag()),
         )
 }

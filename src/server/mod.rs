@@ -7,6 +7,7 @@ mod client_endpoint_control;
 pub(crate) mod client_shell;
 pub(crate) mod client_shell_graphics;
 pub(crate) mod client_transport;
+pub(crate) mod client_url_bridge;
 pub(crate) mod clients;
 pub(crate) mod clipboard_image;
 #[cfg(unix)]

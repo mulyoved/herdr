@@ -358,6 +358,7 @@ impl App {
             .and_then(|pane| pane.cwd.clone())
             .or_else(|| Some(self.default_cwd_for_workspace(ws_idx).display().to_string()));
         PluginInvocationContext {
+            origin_client_id: None,
             workspace_id: Some(workspace.workspace_id),
             workspace_label: Some(workspace.label),
             workspace_cwd,
@@ -391,6 +392,7 @@ impl App {
 
 fn empty_plugin_context(correlation_id: &str) -> PluginInvocationContext {
     PluginInvocationContext {
+        origin_client_id: None,
         workspace_id: None,
         workspace_label: None,
         workspace_cwd: None,

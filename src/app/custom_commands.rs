@@ -77,10 +77,19 @@ impl App {
             .map(|entry| entry.binding.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_command_invoke(
         &mut self,
         id: String,
         params: crate::api::schema::CommandInvokeParams,
+    ) -> String {
+        self.handle_command_invoke_with_origin(id, params, None)
+    }
+    pub(crate) fn handle_command_invoke_with_origin(
+        &mut self,
+        id: String,
+        params: crate::api::schema::CommandInvokeParams,
+        origin_client_id: Option<&str>,
     ) -> String {
         let Some(binding) = self.resolve_client_shell_command(&params.command_id) else {
             return crate::app::api::responses::encode_error(
@@ -94,7 +103,7 @@ impl App {
         }
         let selected_text = if binding.action == crate::config::CustomCommandAction::PluginAction {
             let Some(selection) = params.selection.as_ref() else {
-                return self.execute_custom_command_response(id, &binding, None);
+                return self.execute_custom_command_response(id, &binding, None, origin_client_id);
             };
             if params.pane_id.as_deref() != Some(selection.pane_id.as_str()) {
                 return crate::app::api::responses::encode_error(
@@ -112,7 +121,7 @@ impl App {
         } else {
             None
         };
-        self.execute_custom_command_response(id, &binding, selected_text)
+        self.execute_custom_command_response(id, &binding, selected_text, origin_client_id)
     }
 
     fn execute_custom_command_response(
@@ -120,8 +129,9 @@ impl App {
         id: String,
         binding: &crate::config::CustomCommandKeybind,
         selected_text: Option<String>,
+        origin_client_id: Option<&str>,
     ) -> String {
-        match self.execute_custom_command_binding(binding, selected_text) {
+        match self.execute_custom_command_binding(binding, selected_text, origin_client_id) {
             Ok(()) => crate::app::api::responses::encode_success(
                 id,
                 crate::api::schema::ResponseResult::Ok {},
@@ -213,15 +223,24 @@ impl App {
         &mut self,
         binding: &crate::config::CustomCommandKeybind,
         selected_text: Option<String>,
+        origin_client_id: Option<&str>,
     ) -> io::Result<()> {
         match binding.action {
-            crate::config::CustomCommandAction::Shell => self.spawn_custom_command(binding),
+            crate::config::CustomCommandAction::Shell => {
+                self.spawn_custom_command(binding, origin_client_id)
+            }
             crate::config::CustomCommandAction::Pane => {
                 self.spawn_pane_command(&binding.command, Vec::new())
             }
-            crate::config::CustomCommandAction::Popup => self.spawn_custom_popup_command(binding),
+            crate::config::CustomCommandAction::Popup => {
+                self.spawn_custom_popup_command(binding, origin_client_id)
+            }
             crate::config::CustomCommandAction::PluginAction => self
-                .invoke_plugin_action_from_keybind(binding.command.clone(), selected_text)
+                .invoke_plugin_action_from_keybind_with_origin(
+                    binding.command.clone(),
+                    selected_text,
+                    origin_client_id,
+                )
                 .map_err(io::Error::other),
         }
     }
@@ -229,11 +248,16 @@ impl App {
     fn spawn_custom_popup_command(
         &mut self,
         binding: &crate::config::CustomCommandKeybind,
+        origin_client_id: Option<&str>,
     ) -> io::Result<()> {
+        let mut env = self.custom_command_env().0;
+        if let Some(origin) = origin_client_id {
+            env.push(("HERDR_ORIGIN_CLIENT_ID".into(), origin.into()));
+        }
         self.spawn_popup_shell_command(
             &binding.command,
             None,
-            self.custom_command_env().0,
+            env,
             crate::app::popup::PopupGeometry {
                 width: binding.width,
                 height: binding.height,
@@ -288,6 +312,7 @@ impl App {
     fn spawn_custom_command(
         &mut self,
         binding: &crate::config::CustomCommandKeybind,
+        origin_client_id: Option<&str>,
     ) -> std::io::Result<()> {
         let mut command = crate::platform::detached_custom_command_process(&binding.command);
         command
@@ -295,7 +320,10 @@ impl App {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let (env, cwd) = self.custom_command_env();
-        command.envs(env);
+        command.env_remove("HERDR_ORIGIN_CLIENT_ID").envs(env);
+        if let Some(origin) = origin_client_id {
+            command.env("HERDR_ORIGIN_CLIENT_ID", origin);
+        }
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }

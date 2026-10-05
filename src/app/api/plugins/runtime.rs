@@ -52,6 +52,9 @@ impl App {
                 current_exe.display().to_string(),
             ));
         }
+        if let Some(origin) = context.origin_client_id.as_ref() {
+            env.push(("HERDR_ORIGIN_CLIENT_ID".into(), origin.clone()));
+        }
         if let Some(action_id) = action_id.as_ref() {
             env.push(("HERDR_PLUGIN_ACTION_ID".to_string(), action_id.clone()));
         }
@@ -121,6 +124,7 @@ impl App {
         std::thread::spawn(move || {
             let child =
                 crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
+                    .env_remove("HERDR_ORIGIN_CLIENT_ID")
                     .envs(env)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())

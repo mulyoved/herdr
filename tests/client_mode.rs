@@ -188,6 +188,7 @@ fn spawn_server_with_config(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     support::isolate_herdr_test_process(&mut cmd);
     cmd.arg("server");
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
@@ -2254,4 +2255,203 @@ fn client_receives_notify_on_agent_state_change() {
     );
 
     cleanup_spawned_herdr(spawned, base);
+}
+#[test]
+fn client_url_handler_finishes_on_original_endpoint_after_real_machine_switch() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("replay.txt"),"just test-one client_url_handler_finishes_on_original_endpoint_after_real_machine_switch\n").unwrap();
+    fs::write(base.join("scenario.json"), "{\"hold\":true}").unwrap();
+    let config_home = base.join("config");
+    let runtime = base.join("runtime");
+    let api = runtime.join("herdr.sock");
+    let remote_config = base.join("remote-config");
+    let remote_runtime = base.join("remote-runtime");
+    let remote_api = remote_runtime.join("herdr.sock");
+    let handler = serde_json::json!([
+        "/usr/bin/python3",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/client-url/handler.py"
+        ),
+        base
+    ]);
+    let contents = format!("onboarding=false\n[client]\nopen_url_command={handler}\n");
+    let _local = spawn_server_with_config(
+        &config_home,
+        &runtime,
+        &api,
+        &runtime.join("herdr-client.sock"),
+        &contents,
+    );
+    let _remote = spawn_server(
+        &remote_config,
+        &remote_runtime,
+        &remote_api,
+        &remote_runtime.join("herdr-client.sock"),
+    );
+    wait_for_socket(&api, Duration::from_secs(10));
+    wait_for_socket(&remote_api, Duration::from_secs(10));
+    for (socket, label) in [(&api, "URL Local"), (&remote_api, "URL Remote")] {
+        let created=send_json_request(socket,&serde_json::json!({"id":"workspace","method":"workspace.create","params":{"cwd":base,"label":label,"focus":true}}).to_string());
+        let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+        send_pane_shell_command(
+            socket,
+            pane,
+            if label == "URL Local" {
+                "printf 'LOCAL_URL_ENDPOINT\\n'"
+            } else {
+                "printf 'REMOTE_URL_ENDPOINT\\n'"
+            },
+        );
+    }
+    let catalog = runtime.join("state").join(app_dir_name()).join("client");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::write(catalog.join("endpoints.json"),serde_json::json!({"version":1,"ssh":[{"id":"0123456789abcdef0123456789abcdef","label":"URL remote","target":"test-only","session":"default","enabled":true}]}).to_string()).unwrap();
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(base.join("home")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_herdr"), bin.join("herdr")).unwrap();
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    fs::write(bin.join("ssh"),format!("#!/bin/sh\nexport HOME={} XDG_CONFIG_HOME={} XDG_RUNTIME_DIR={} HERDR_SOCKET_PATH={}\nunset HERDR_CONFIG_PATH HERDR_CLIENT_SOCKET_PATH HERDR_SESSION\nfor arg do last=\"$arg\"; done\necho $$ > {}\nexec /bin/sh -c \"$last\"\n",quote(&base.join("home")),quote(&remote_config),quote(&remote_runtime),quote(&remote_api),quote(&base.join("bridge.pid")))).unwrap();
+    fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime,
+        &api,
+        &["client"],
+        &[("PATH", &path)],
+    );
+    let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+    let screen = || terminal_screen::text(&output.lock().unwrap().bytes, 80, 24);
+    assert!(
+        wait_until(
+            Duration::from_secs(15),
+            Duration::from_millis(20),
+            || screen().contains("LOCAL_URL_ENDPOINT") && screen().contains("URL Remote")
+        ),
+        "federated bootstrap missing: {}",
+        screen()
+    );
+    let id = send_json_request(
+        &api,
+        "{\"id\":\"clients\",\"method\":\"client.list\",\"params\":{}}",
+    )["result"]["clients"][0]["client_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let socket = api.clone();
+    let pending = thread::spawn(move || {
+        send_json_request(&socket,&serde_json::json!({"id":"open","method":"client.open_url","params":{"url":"https://example.com/","client":id}}).to_string())
+    });
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(10), || base
+            .join("handler-events.jsonl")
+            .exists()),
+        "handler missing: {}",
+        base.display()
+    );
+    let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
+    input
+        .write_all(&sidebar_row_click(&screen(), "URL Remote"))
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            screen().contains("REMOTE_URL_ENDPOINT")
+        }),
+        "switch stalled by handler"
+    );
+    let responsive = wait_until(Duration::from_secs(5), Duration::from_millis(100), || {
+        if screen().contains("RESPONSIVE_DURING_URL_HANDLER") {
+            return true;
+        }
+        input
+            .write_all(b"printf 'RESPONSIVE_%s\\n' DURING_URL_HANDLER\r")
+            .unwrap();
+        false
+    });
+    fs::write(base.join("client.pty"), read_output(&output)).unwrap();
+    assert!(responsive, "input blocked by handler");
+    fs::write(base.join("release"), "").unwrap();
+    let response = pending.join().unwrap();
+    assert_eq!(response["result"]["outcome"], "opened");
+    fs::write(base.join("observed.json"), response.to_string()).unwrap();
+    fs::write(base.join("client.pty"), read_output(&output)).unwrap();
+    assert_eq!(
+        fs::read_to_string(base.join("handler-events.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    // Lose only this fixture's SSH bridge while a handler runs, then reconnect the same endpoint.
+    fs::remove_file(base.join("release")).unwrap();
+    let original_id = send_json_request(
+        &remote_api,
+        "{\"id\":\"clients\",\"method\":\"client.list\",\"params\":{}}",
+    )["result"]["clients"][0]["client_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let socket = remote_api.clone();
+    let selected = original_id.clone();
+    let stale = thread::spawn(move || {
+        send_json_request(&socket,&serde_json::json!({"id":"old-generation","method":"client.open_url","params":{"url":"https://example.com/","client":selected}}).to_string())
+    });
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(base.join("handler-events.jsonl"))
+            .is_ok_and(|s| s.lines().count() == 2)
+    ));
+    let pid: libc::pid_t = fs::read_to_string(base.join("bridge.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert_eq!(
+        stale.join().unwrap()["error"]["code"],
+        "indeterminate_delivery"
+    );
+    let restored = wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
+        send_json_request(
+            &remote_api,
+            "{\"id\":\"clients\",\"method\":\"client.list\",\"params\":{}}",
+        )["result"]["clients"]
+            .as_array()
+            .is_some_and(|c| {
+                c.iter()
+                    .any(|x| x["client_id"].as_str().is_some_and(|id| id != original_id))
+            })
+    });
+    fs::write(base.join("reconnect.pty"), read_output(&output)).unwrap();
+    assert!(restored, "fixture bridge did not reconnect: {}", screen());
+    let new_id = send_json_request(
+        &remote_api,
+        "{\"id\":\"clients\",\"method\":\"client.list\",\"params\":{}}",
+    )["result"]["clients"][0]["client_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::write(base.join("release"), "").unwrap();
+    let fresh=send_json_request(&remote_api,&serde_json::json!({"id":"new-generation","method":"client.open_url","params":{"url":"https://example.com/","client":new_id}}).to_string());
+    assert_eq!(fresh["result"]["outcome"], "opened");
+    fs::write(base.join("reconnected-observed.json"), fresh.to_string()).unwrap();
+    assert_eq!(
+        fs::read_to_string(base.join("handler-events.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+    drop(client);
 }

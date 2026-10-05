@@ -74,6 +74,24 @@ impl ApiClient {
         read_json_line(&mut reader)
     }
 
+    /// Absolute response deadline, including partial lines and named pipes.
+    pub fn request_value_with_deadline(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ApiClientError> {
+        let deadline = Instant::now() + timeout;
+        let mut stream = self.connect()?;
+        set_timeout_best_effort(&stream, TimeoutKind::Send, timeout)?;
+        write_request(&mut stream, request)?;
+        crate::ipc::set_local_stream_polling(&mut stream, true)?;
+        let mut reader = BufReader::new(DeadlineReader {
+            stream: &mut stream,
+            deadline,
+        });
+        read_json_line(&mut reader)
+    }
+
     pub fn status(&self) -> Result<crate::api::RuntimeStatus, ApiClientError> {
         self.read_status(None)
     }

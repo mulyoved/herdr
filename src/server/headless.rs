@@ -73,6 +73,7 @@ use crate::server::socket_paths::{
 use crate::server::terminal_attach::paste_payload_for_runtime;
 
 mod bootstrap;
+mod client_urls;
 mod client_views;
 mod endpoint_requests;
 mod lifecycle;
@@ -206,6 +207,7 @@ pub struct HeadlessServer {
     popup_owner_tab_id: Option<String>,
     /// Process-local identity used to reject shell replacements from an earlier server boot.
     client_shell_boot_id: String,
+    client_url_bridge: crate::server::client_url_bridge::ClientUrlBridge,
     /// Outer window title last pushed, paired with the client that received it.
     /// Keying on the client means a newly attached terminal is written to even
     /// when the title itself has not changed, without every code path that
@@ -345,6 +347,7 @@ impl HeadlessServer {
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
+            client_url_bridge: Default::default(),
             tab_geometry_controllers: HashMap::new(),
             popup_owner_tab_id: None,
             client_shell_boot_id: format!(
@@ -896,6 +899,7 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.client_url_bridge.disconnect(client_id);
         self.disconnect_native_graphics(client_id);
         let disconnected_focus = self
             .clients
@@ -1848,8 +1852,17 @@ impl HeadlessServer {
                 self.clients.insert(client_id, connection);
                 false
             }
+            ServerEvent::ClientUrlCompleted {
+                client_id,
+                completion,
+            } => {
+                self.client_url_bridge.complete(client_id, completion);
+                false
+            }
             ServerEvent::ClientShellConnected {
                 client_id,
+                client_actions,
+                client_platform,
                 surface_cols,
                 surface_rows,
                 cell_width_px,
@@ -1963,6 +1976,8 @@ impl HeadlessServer {
                 connection.shell_snapshot = Some(seed_snapshot);
                 connection.shell_agent_completions = Some(completion_projection);
                 connection.shell_agent_view = agent_view;
+                connection.client_actions = client_actions;
+                connection.client_platform = client_platform;
                 self.clients.insert(client_id, connection);
                 if self.app.state.popup_pane.is_some() && self.popup_owner_tab_id.is_none() {
                     self.popup_owner_tab_id = self.shell_tab_id_for_client(client_id);
@@ -2879,6 +2894,14 @@ impl HeadlessServer {
             return true;
         }
 
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::ClientList(_) | api::schema::Method::ClientOpenUrl(_)
+        ) {
+            self.handle_client_url_api(msg);
+            return false;
+        }
+
         if let api::schema::Method::NotificationShow(params) = &msg.request.method {
             let response =
                 self.handle_notification_show_api(msg.request.id.clone(), params.clone());
@@ -3010,7 +3033,7 @@ impl HeadlessServer {
             })
         } else {
             self.app
-                .handle_api_request_after_internal_events_drained(msg.request)
+                .handle_api_request_with_origin(msg.request, msg.origin_client_id.as_deref())
         };
         if let Some(snapshot) = frozen_alt_screen_read {
             if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)
@@ -3195,6 +3218,7 @@ impl HeadlessServer {
     ///
     /// Similar to the former App scheduler but without terminal resize polling.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
+        self.client_url_bridge.expire(now);
         let mut changed = false;
 
         // No resize polling needed — server has no terminal.

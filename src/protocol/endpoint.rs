@@ -45,6 +45,10 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointClientHello {
+    #[serde(default)]
+    pub client_actions: Vec<String>,
+    #[serde(default)]
+    pub client_platform: Option<String>,
     pub generation: u32,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
@@ -203,6 +207,8 @@ mod tests {
 
     fn hello() -> EndpointClientHello {
         EndpointClientHello {
+            client_actions: Vec::new(),
+            client_platform: None,
             generation: ENDPOINT_PROTOCOL_GENERATION,
             cell_width_px: 8,
             cell_height_px: 16,

@@ -184,6 +184,14 @@ pub(super) fn do_handshake(
     let endpoint_shell = shell_surface_size.is_some();
     let hello = if let Some(surface_size) = shell_surface_size {
         let hello = EndpointClientHello {
+            client_actions: if super::url_actions::command_available(
+                &super::url_actions::local_command(),
+            ) {
+                vec![crate::client_url::CAPABILITY.into()]
+            } else {
+                Vec::new()
+            },
+            client_platform: Some(std::env::consts::OS.into()),
             generation: ENDPOINT_PROTOCOL_GENERATION,
             cell_width_px,
             cell_height_px,

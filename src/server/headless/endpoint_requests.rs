@@ -124,6 +124,7 @@ impl HeadlessServer {
             | self.handle_client_shell_api_request(
                 client_id,
                 api::ApiRequestMessage {
+                    origin_client_id: Some(self.public_client_id(client_id)),
                     request: *request,
                     respond_to,
                     response_write_complete: None,

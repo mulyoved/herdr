@@ -7,6 +7,7 @@ pub(crate) struct DecodedAgentViewProjection {
 }
 
 pub(crate) enum EndpointControlMessage {
+    OpenUrl(crate::client_url::OpenUrlControl),
     HealthPong,
     AgentViewProjection(DecodedAgentViewProjection),
     AgentCompletions(crate::protocol::endpoint::EndpointAgentCompletions),
@@ -18,6 +19,28 @@ pub(crate) fn decode_endpoint_control(
     kind: &str,
     data: &str,
 ) -> Result<EndpointControlMessage, String> {
+    if kind == crate::client_url::REQUEST_KIND {
+        if data.len() > crate::client_url::MAX_CONTROL_BYTES {
+            return Ok(EndpointControlMessage::Ignored);
+        }
+        return Ok(
+            serde_json::from_str::<crate::client_url::OpenUrlControl>(data)
+                .ok()
+                .filter(|r| {
+                    !r.request_id.is_empty()
+                        && r.request_id.len() <= 128
+                        && !r.boot_id.is_empty()
+                        && r.boot_id.len() <= 256
+                        && !r
+                            .request_id
+                            .chars()
+                            .chain(r.boot_id.chars())
+                            .any(char::is_control)
+                })
+                .map(EndpointControlMessage::OpenUrl)
+                .unwrap_or(EndpointControlMessage::Ignored),
+        );
+    }
     if kind == crate::protocol::endpoint::HEALTH_PONG_KIND {
         return Ok(EndpointControlMessage::HealthPong);
     }

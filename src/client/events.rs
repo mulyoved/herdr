@@ -2,6 +2,11 @@ use super::*;
 
 /// Internal events for the client event loop.
 pub(super) enum ClientLoopEvent {
+    UrlActionFinished {
+        endpoint_id: endpoint::ClientEndpointId,
+        generation: u64,
+        completion: crate::client_url::OpenUrlCompletion,
+    },
     #[cfg(unix)]
     StdinInput(Vec<u8>),
     #[cfg(unix)]

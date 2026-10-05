@@ -475,6 +475,7 @@ fn plugin_action_invoke(args: &[String]) -> std::io::Result<i32> {
         action_id: action_id.clone(),
         plugin_id,
         context: Some(PluginInvocationContext {
+            origin_client_id: None,
             workspace_id: None,
             workspace_label: None,
             workspace_cwd: None,

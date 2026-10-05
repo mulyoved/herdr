@@ -297,13 +297,54 @@ pub fn client_handshake(
     decode_welcome(&response)
 }
 
+pub mod client_url;
+pub mod url_handler;
+
+pub fn send_named_control(stream: &mut UnixStream, kind: &str, data: &serde_json::Value) {
+    let payload = encode_varint_enum(
+        CLIENT_MESSAGE_ENDPOINT_CONTROL,
+        &[&encode_string(kind), &encode_string(&data.to_string())],
+    );
+    stream.write_all(&frame_message(&payload)).unwrap();
+}
+
+pub fn decode_named_control(payload: &[u8]) -> Result<(String, serde_json::Value), String> {
+    let mut offset = 0;
+    let kind = decode_string(payload, &mut offset)?;
+    let data = decode_string(payload, &mut offset)?;
+    Ok((
+        kind,
+        serde_json::from_str(&data).map_err(|e| e.to_string())?,
+    ))
+}
+
 pub fn client_shell_handshake(
     stream: &mut UnixStream,
     endpoint_generation: u32,
     surface_cols: u16,
     surface_rows: u16,
 ) -> Result<(u32, Option<String>), String> {
+    client_shell_handshake_with_actions(
+        stream,
+        endpoint_generation,
+        surface_cols,
+        surface_rows,
+        &[],
+        "fixture",
+    )
+}
+
+pub fn client_shell_handshake_with_actions(
+    stream: &mut UnixStream,
+    endpoint_generation: u32,
+    surface_cols: u16,
+    surface_rows: u16,
+    actions: &[&str],
+    platform: &str,
+) -> Result<(u32, Option<String>), String> {
     let data = serde_json::json!({
+        "client_actions": actions,
+        "client_platform": platform,
         "generation": endpoint_generation,
         "cell_width_px": 8,
         "cell_height_px": 16,

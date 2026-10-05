@@ -40,6 +40,7 @@ mod terminal_sessions;
 mod terminal_setup;
 mod timer;
 mod transport;
+mod url_actions;
 
 #[cfg(test)]
 use clipboard_forwarding::decode_clipboard_payload;
@@ -506,6 +507,8 @@ async fn run_client_loop(
 
     // Channel for events from the resize and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    let url_dispatcher = url_actions::UrlActionDispatcher::new(event_tx.clone())
+        .map_err(ClientError::ConnectionFailed)?;
     let (supervisor_tx, mut supervisor_rx) =
         tokio::sync::mpsc::channel::<endpoint::EndpointSupervisorEvent>(64);
     // Keep Windows console draining independent of server-frame backpressure.
@@ -1379,6 +1382,29 @@ async fn run_client_loop(
                     &mut scheduled_activation,
                 )?;
             }
+            ClientLoopEvent::UrlActionFinished {
+                endpoint_id,
+                generation,
+                completion,
+            } => {
+                if write_stream.accepts(&endpoint_id, generation)
+                    && state
+                        .shell
+                        .as_ref()
+                        .and_then(|s| s.endpoint_snapshot_identity(&endpoint_id, generation))
+                        .is_some_and(|(boot, _)| boot == completion.boot_id)
+                {
+                    if let Ok(data) = serde_json::to_string(&completion) {
+                        write_stream.send_to(
+                            &endpoint_id,
+                            &ClientMessage::EndpointControl {
+                                kind: crate::client_url::RESULT_KIND.into(),
+                                data,
+                            },
+                        );
+                    }
+                }
+            }
             ClientLoopEvent::ServerMessage {
                 endpoint_id,
                 generation,
@@ -2045,6 +2071,25 @@ async fn run_client_loop(
                             continue;
                         }
                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
+                            Ok(endpoint::EndpointControlMessage::OpenUrl(request)) => {
+                                if state
+                                    .shell
+                                    .as_ref()
+                                    .and_then(|s| {
+                                        s.endpoint_snapshot_identity(&endpoint_id, generation)
+                                    })
+                                    .is_some_and(|(boot, _)| boot == request.boot_id)
+                                {
+                                    url_dispatcher.enqueue(
+                                        endpoint_id,
+                                        generation,
+                                        request,
+                                        url_actions::local_command(),
+                                        std::time::Instant::now(),
+                                    );
+                                }
+                                continue;
+                            }
                             Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
                             Ok(endpoint::EndpointControlMessage::AgentViewProjection(
                                 projection,

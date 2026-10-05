@@ -296,6 +296,7 @@ fn validate_machine_command(args: &[String]) -> Result<(), String> {
                         .iter()
                         .any(|arg| arg == "--file" || arg.starts_with("--file=")))
         }
+        "client" => matches!(subcommand, "list" | "open-url"),
         "api" => subcommand == "snapshot",
         "status" => subcommand == "server",
         "plugin" => matches!(

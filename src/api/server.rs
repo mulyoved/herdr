@@ -575,6 +575,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ProductAnnouncementDismiss(_) => "product_announcement.dismiss",
         Method::ReleaseNotesDismiss(_) => "release_notes.dismiss",
         Method::CommandInvoke(_) => "command.invoke",
+        Method::ClientList(_) => "client.list",
+        Method::ClientOpenUrl(_) => "client.open_url",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
         Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
@@ -1028,6 +1030,7 @@ fn dispatch_to_app(
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
+        origin_client_id: None,
         request,
         respond_to,
         response_write_complete,

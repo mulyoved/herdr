@@ -172,6 +172,7 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     // A new pane is not a child agent of the process that started the server.
     // Explicit launch env below can opt back into an intentional child session.
     for key in [
+        "HERDR_ORIGIN_CLIENT_ID",
         "CODEX_THREAD_ID",
         "OMPCODE",
         "CLAUDECODE",

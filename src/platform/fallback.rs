@@ -257,3 +257,6 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
 pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
     Ok(false)
 }
+pub(crate) fn command_is_executable(_path: &std::path::Path) -> bool {
+    false
+}

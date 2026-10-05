@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod agents;
+pub mod clients;
 pub mod commands;
 pub mod common;
 pub mod events;
@@ -15,6 +16,7 @@ pub mod workspaces;
 pub mod worktrees;
 
 pub use agents::*;
+pub use clients::*;
 pub use commands::*;
 pub use common::*;
 pub use events::*;
@@ -69,6 +71,10 @@ pub enum Method {
     CommandInvoke(CommandInvokeParams),
     #[serde(rename = "client.window_title.set")]
     ClientWindowTitleSet(ClientWindowTitleSetParams),
+    #[serde(rename = "client.list")]
+    ClientList(EmptyParams),
+    #[serde(rename = "client.open_url")]
+    ClientOpenUrl(ClientOpenUrlParams),
     #[serde(rename = "client.window_title.clear")]
     ClientWindowTitleClear(EmptyParams),
     #[serde(rename = "client_shell.surface.set")]

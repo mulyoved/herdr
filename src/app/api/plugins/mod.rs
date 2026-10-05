@@ -178,6 +178,7 @@ impl App {
         &mut self,
         id: String,
         params: PluginActionInvokeParams,
+        origin_client_id: Option<&str>,
     ) -> String {
         if let Err(err) = self.refresh_installed_plugins() {
             return encode_error(id, "plugin_registry_load_failed", err.to_string());
@@ -200,7 +201,8 @@ impl App {
         ) {
             return encode_error(id, code, message);
         }
-        let context = self.merge_plugin_context(params.context, &id);
+        let mut context = self.merge_plugin_context(params.context, &id);
+        context.origin_client_id = origin_client_id.map(str::to_owned);
         let log = match self.start_plugin_command(
             &plugin,
             Some(action.action_id.clone()),
@@ -222,10 +224,19 @@ impl App {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn invoke_plugin_action_from_keybind(
         &mut self,
         action_id: String,
         selected_text: Option<String>,
+    ) -> Result<(), String> {
+        self.invoke_plugin_action_from_keybind_with_origin(action_id, selected_text, None)
+    }
+    pub(crate) fn invoke_plugin_action_from_keybind_with_origin(
+        &mut self,
+        action_id: String,
+        selected_text: Option<String>,
+        origin_client_id: Option<&str>,
     ) -> Result<(), String> {
         self.refresh_installed_plugins()
             .map_err(|err| format!("failed to load plugin registry: {err}"))?;
@@ -241,6 +252,7 @@ impl App {
         )
         .map_err(|(_, message)| message)?;
         let mut context = self.current_plugin_context("keybinding");
+        context.origin_client_id = origin_client_id.map(str::to_owned);
         context.invocation_source = Some("keybinding".to_string());
         context.selected_text = selected_text;
         self.start_plugin_command(
@@ -2452,6 +2464,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
                 plugin_id: Some("example.worktree-bootstrap".into()),
                 action_id: "bootstrap".into(),
                 context: Some(PluginInvocationContext {
+                    origin_client_id: None,
                     workspace_id: Some("1".into()),
                     workspace_label: None,
                     workspace_cwd: None,

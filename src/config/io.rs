@@ -5,6 +5,7 @@ use tracing::warn;
 use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
+    "client",
     "advanced",
     "experimental",
     "keys",
@@ -277,6 +278,15 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     let mut diagnostics = unknown_top_level_section_diagnostics(table);
     diagnostics.extend(unknown_top_level_config_key_diagnostics(table));
     let mut invalid_sections = Vec::new();
+
+    load_live_section(
+        table,
+        "client",
+        "client config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.client = section,
+    );
 
     if let Some(value) = table.get("onboarding") {
         match value.clone().try_into::<Option<bool>>() {

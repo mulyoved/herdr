@@ -407,6 +407,8 @@ pub(crate) enum ServerEvent {
     /// A client-owned shell completed its dedicated handshake.
     ClientShellConnected {
         client_id: u64,
+        client_actions: Vec<String>,
+        client_platform: String,
         surface_cols: u16,
         surface_rows: u16,
         cell_width_px: u32,
@@ -420,6 +422,10 @@ pub(crate) enum ServerEvent {
         surface_delta: bool,
         surface_scroll: bool,
         writer: ClientWriter,
+    },
+    ClientUrlCompleted {
+        client_id: u64,
+        completion: crate::client_url::OpenUrlCompletion,
     },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
@@ -747,7 +753,18 @@ pub(crate) fn handle_client_handshake(
                     return Ok(());
                 }
             };
-            let incompatibility = if hello.generation != ENDPOINT_PROTOCOL_GENERATION {
+            let incompatibility = if hello.client_actions.len() > 16
+                || hello
+                    .client_actions
+                    .iter()
+                    .any(|v| v.len() > 64 || v.chars().any(char::is_control))
+                || hello
+                    .client_platform
+                    .as_ref()
+                    .is_some_and(|v| v.len() > 64 || v.chars().any(char::is_control))
+            {
+                Some(("invalid_hello", "invalid client action metadata".to_owned()))
+            } else if hello.generation != ENDPOINT_PROTOCOL_GENERATION {
                 Some((
                     "unsupported_generation",
                     format!(
@@ -787,6 +804,8 @@ pub(crate) fn handle_client_handshake(
                     hello.surface_reuse,
                     hello.surface_delta,
                     hello.surface_scroll,
+                    hello.client_actions,
+                    hello.client_platform.unwrap_or_else(|| "unknown".into()),
                 )),
             )
         }
@@ -884,6 +903,8 @@ pub(crate) fn handle_client_handshake(
         surface_reuse,
         surface_delta,
         surface_scroll,
+        client_actions,
+        client_platform,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -900,6 +921,8 @@ pub(crate) fn handle_client_handshake(
             surface_reuse,
             surface_delta,
             surface_scroll,
+            client_actions,
+            client_platform,
             writer,
         }
     } else {
@@ -1347,6 +1370,20 @@ fn client_read_loop_with_endpoint_controls(
                 }
             }
             ClientMessage::EndpointControl { kind, data } => {
+                if kind == crate::client_url::RESULT_KIND {
+                    if data.len() <= crate::client_url::MAX_CONTROL_BYTES {
+                        if let Ok(completion) =
+                            serde_json::from_str::<crate::client_url::OpenUrlCompletion>(&data)
+                        {
+                            let _ =
+                                server_event_tx.blocking_send(ServerEvent::ClientUrlCompleted {
+                                    client_id,
+                                    completion,
+                                });
+                        }
+                    }
+                    continue;
+                }
                 let Some(response) = crate::server::client_endpoint_control::response(&kind, data)
                 else {
                     debug!(client_id, %kind, "ignoring unknown endpoint control message");
@@ -1462,6 +1499,8 @@ mod tests {
 
     fn endpoint_hello(surface_cols: u16, surface_rows: u16) -> ClientMessage {
         let hello = EndpointClientHello {
+            client_actions: Vec::new(),
+            client_platform: None,
             generation: ENDPOINT_PROTOCOL_GENERATION,
             cell_width_px: 8,
             cell_height_px: 16,
@@ -1982,6 +2021,8 @@ mod tests {
             .expect("client shell connected event")
         {
             ServerEvent::ClientShellConnected {
+                client_actions: _,
+                client_platform: _,
                 client_id,
                 surface_cols,
                 surface_rows,

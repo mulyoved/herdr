@@ -901,9 +901,17 @@ impl App {
         self.handle_api_request_after_internal_events_drained(request)
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_api_request_after_internal_events_drained(
         &mut self,
         request: crate::api::schema::Request,
+    ) -> String {
+        self.handle_api_request_with_origin(request, None)
+    }
+    pub(crate) fn handle_api_request_with_origin(
+        &mut self,
+        request: crate::api::schema::Request,
+        origin_client_id: Option<&str>,
     ) -> String {
         self.sync_pending_terminal_titles();
         use crate::api::schema::{
@@ -1019,7 +1027,18 @@ impl App {
                 return responses::encode_success(request.id, ResponseResult::Ok {});
             }
             Method::CommandInvoke(params) => {
-                return self.handle_command_invoke(request.id, params);
+                return self.handle_command_invoke_with_origin(
+                    request.id,
+                    params,
+                    origin_client_id,
+                );
+            }
+            Method::ClientList(_) | Method::ClientOpenUrl(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "client_unavailable",
+                    "client URL actions require a headless server",
+                );
             }
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(
@@ -1214,7 +1233,7 @@ impl App {
                 return self.handle_plugin_action_list(request.id, params);
             }
             Method::PluginActionInvoke(params) => {
-                return self.handle_plugin_action_invoke(request.id, params);
+                return self.handle_plugin_action_invoke(request.id, params, origin_client_id);
             }
             Method::PluginLogList(params) => {
                 return self.handle_plugin_log_list(request.id, params);
