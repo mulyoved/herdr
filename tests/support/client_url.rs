@@ -27,7 +27,8 @@ impl UrlFixture {
         Self::start_with_origin(contents, None)
     }
     pub fn start_with_origin(contents: &str, origin: Option<&str>) -> Self {
-        let artifact_dir = std::env::temp_dir().join(format!(
+        // macOS TMPDIR can exhaust the Unix socket path budget before the fixture suffix.
+        let artifact_dir = PathBuf::from("/tmp").join(format!(
             "herdr-client-url-{}-{}",
             std::process::id(),
             SystemTime::now()

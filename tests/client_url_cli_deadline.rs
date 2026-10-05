@@ -6,7 +6,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn client_url_bridge_cli_native_ipc_partial_reply_deadline() {
-    let root = std::env::temp_dir().join(format!(
+    #[cfg(unix)]
+    let temporary_root = std::path::PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let temporary_root = std::env::temp_dir();
+    let root = temporary_root.join(format!(
         "herdr-url-ipc-{}-{}",
         std::process::id(),
         SystemTime::now()

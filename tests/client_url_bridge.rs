@@ -78,7 +78,8 @@ fn client_url_bridge_cli_partial_reply_has_absolute_deadline_and_no_retry() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::time::{Duration, Instant};
-    let root = std::env::temp_dir().join(format!("herdr-url-cli-stalled-{}", std::process::id()));
+    let root = std::path::PathBuf::from("/tmp")
+        .join(format!("herdr-url-cli-stalled-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("api.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -396,7 +397,7 @@ fn client_url_bridge_cli_rejects_wrong_id_and_bad_outcome() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     for wrong_id in [true, false] {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::path::PathBuf::from("/tmp").join(format!(
             "herdr-url-invalid-result-{}-{wrong_id}",
             std::process::id()
         ));
