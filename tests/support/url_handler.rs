@@ -65,6 +65,7 @@ impl HandlerFixture {
         cmd.env("XDG_STATE_HOME", root.join("client-state"));
         cmd.env("XDG_RUNTIME_DIR", root.join("client-runtime"));
         cmd.env("HERDR_DISABLE_SOUND", "1");
+        cmd.env("HERDR_LOG", "herdr::client=debug,herdr::server=debug");
         cmd.env_remove("HERDR_ENV");
         let child = pair.slave.spawn_command(cmd).unwrap();
         register_spawned_herdr_pid(child.process_id());
@@ -100,6 +101,12 @@ impl HandlerFixture {
         let mut upstream =
             UnixStream::connect(server.api.with_file_name("herdr-client.sock")).unwrap();
         let mut raw = encode_varint_u32(first_frame.0);
+        fs::write(
+            root.join("first-client-frame.json"),
+            json!({"kind":first_frame.0,"control":decode_named_control(&first_frame.1).ok()})
+                .to_string(),
+        )
+        .unwrap();
         raw.extend(first_frame.1);
         upstream.write_all(&frame_message(&raw)).unwrap();
         let peer = Arc::new(Mutex::new(downstream.try_clone().unwrap()));
@@ -154,9 +161,16 @@ impl HandlerFixture {
                     .as_array()
                     .is_some_and(|c| !c.is_empty())
             }),
-            "client bootstrap missing: {}; server={}; client={}; controls={}",
+            "client bootstrap missing: {}; API={}; first={}; server={}; server_trace={}; client_trace={}; client={}; controls={}",
             fixture.server.artifact_dir.display(),
+            fixture.server.call("client.list", json!({})),
+            fs::read_to_string(fixture.server.artifact_dir.join("first-client-frame.json"))
+                .unwrap_or_default(),
             fs::read_to_string(fixture.server.artifact_dir.join("server.log")).unwrap_or_default(),
+            fs::read_to_string(fixture.server.artifact_dir.join("config/herdr-dev/herdr-server.log"))
+                .unwrap_or_default(),
+            fs::read_to_string(fixture.server.artifact_dir.join("client-config/herdr-dev/herdr-client.log"))
+                .unwrap_or_default(),
             fs::read_to_string(fixture.server.artifact_dir.join("client.log")).unwrap_or_default(),
             fs::read_to_string(fixture.server.artifact_dir.join("client-controls.jsonl"))
                 .unwrap_or_default()
