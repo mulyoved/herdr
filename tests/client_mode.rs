@@ -2269,20 +2269,13 @@ fn client_url_handler_finishes_on_original_endpoint_after_real_machine_switch() 
     let remote_config = base.join("remote-config");
     let remote_runtime = base.join("remote-runtime");
     let remote_api = remote_runtime.join("herdr.sock");
-    let launcher = base.join("handler-launcher.sh");
-    fs::write(
-        &launcher,
-        "#!/bin/sh\necho $$ > \"$1/handler.pid\"\nexec /usr/bin/python3 \"$2\" \"$1\"\n",
-    )
-    .unwrap();
     let handler = serde_json::json!([
-        "/bin/sh",
-        launcher,
-        base,
+        support::python_executable(),
         concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/client-url/handler.py"
-        )
+        ),
+        base
     ]);
     let contents = format!("onboarding=false\n[client]\nopen_url_command={handler}\n");
     let _local = spawn_server_with_config(
@@ -2369,41 +2362,8 @@ fn client_url_handler_finishes_on_original_endpoint_after_real_machine_switch() 
         let observed = serde_json::json!({"response":response,"clients":clients});
         fs::write(base.join("observed.json"), observed.to_string()).unwrap();
         fs::write(base.join("client.pty"), read_output(&output)).unwrap();
-        let handler_pid = fs::read_to_string(base.join("handler.pid")).unwrap_or_default();
-        #[cfg(target_os = "macos")]
-        if handler_pid.trim().is_empty() {
-            let pid = client.child.process_id().unwrap().to_string();
-            let sample = std::process::Command::new("sample")
-                .args([pid.as_str(), "1", "1"])
-                .output()
-                .unwrap();
-            fs::write(base.join("client.sample.txt"), &sample.stdout).unwrap();
-            eprintln!("client sample: {}", String::from_utf8_lossy(&sample.stdout));
-        }
-        if !handler_pid.trim().is_empty() {
-            let process = std::process::Command::new("ps")
-                .args(["-p", handler_pid.trim(), "-o", "pid,ppid,state,comm"])
-                .output()
-                .unwrap();
-            eprintln!(
-                "handler process: {}",
-                String::from_utf8_lossy(&process.stdout)
-            );
-            #[cfg(target_os = "macos")]
-            {
-                let sample = std::process::Command::new("sample")
-                    .args([handler_pid.trim(), "1", "1"])
-                    .output()
-                    .unwrap();
-                fs::write(base.join("handler.sample.txt"), &sample.stdout).unwrap();
-                eprintln!(
-                    "handler sample: {}",
-                    String::from_utf8_lossy(&sample.stdout)
-                );
-            }
-        }
         panic!(
-            "handler missing: {}; pid={handler_pid}; observed={observed}; screen={}",
+            "handler missing: {}; observed={observed}; screen={}",
             base.display(),
             screen()
         );

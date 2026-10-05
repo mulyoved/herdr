@@ -31,6 +31,26 @@ pub fn isolate_herdr_test_process(command: &mut CommandBuilder) {
     command.env_remove("HERDR_SESSION");
 }
 
+pub fn python_executable() -> PathBuf {
+    static PYTHON: OnceLock<PathBuf> = OnceLock::new();
+    PYTHON
+        .get_or_init(|| {
+            // Resolve macOS's xcrun shim before starting any handler deadline.
+            let output = std::process::Command::new("python3")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Python resolution failed: {output:?}"
+            );
+            let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+            assert!(path.is_absolute() && path.is_file());
+            path
+        })
+        .clone()
+}
+
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;

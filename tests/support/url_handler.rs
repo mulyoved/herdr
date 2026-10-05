@@ -21,12 +21,16 @@ impl HandlerFixture {
         fs::write(root.join("scenario.json"), scenario.to_string()).unwrap();
         fs::write(
             root.join("replay.txt"),
-            "just test-one client_url_handler\n",
+            if std::env::var_os("HERDR_TEST_URL_PROXY_PROBE").is_some() {
+                "HERDR_TEST_URL_PROXY_PROBE=1 just test-one client_url_handler\n"
+            } else {
+                "just test-one client_url_handler\n"
+            },
         )
         .unwrap();
         let config = root.join("client.toml");
         let argv = json!([
-            "/usr/bin/python3",
+            python_executable(),
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/client-url/handler.py"
@@ -40,6 +44,9 @@ impl HandlerFixture {
         .unwrap();
         let proxy = root.join("proxy.sock");
         let listener = UnixListener::bind(&proxy).unwrap();
+        if std::env::var_os("HERDR_TEST_URL_PROXY_PROBE").is_some() {
+            drop(UnixStream::connect(&proxy).unwrap());
+        }
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -70,15 +77,31 @@ impl HandlerFixture {
         });
         listener.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut downstream = loop {
+        let (mut downstream, first_frame) = loop {
+            assert!(Instant::now() < deadline, "client handshake missing");
             match listener.accept() {
-                Ok((s, _)) => break s,
+                Ok((mut s, _)) => {
+                    s.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+                        .unwrap();
+                    match read_server_message(&mut s) {
+                        Ok(frame) => {
+                            s.set_read_timeout(None).unwrap();
+                            break (s, frame);
+                        }
+                        // Readiness probes connect and close without sending a handshake.
+                        Err(_) if Instant::now() < deadline => continue,
+                        Err(e) => panic!("client handshake: {e}"),
+                    }
+                }
                 Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 Err(e) => panic!("client attach: {e}"),
             }
         };
         let mut upstream =
             UnixStream::connect(server.api.with_file_name("herdr-client.sock")).unwrap();
+        let mut raw = encode_varint_u32(first_frame.0);
+        raw.extend(first_frame.1);
+        upstream.write_all(&frame_message(&raw)).unwrap();
         let peer = Arc::new(Mutex::new(downstream.try_clone().unwrap()));
         let write_peer = peer.clone();
         let (tx, messages) = mpsc::channel();

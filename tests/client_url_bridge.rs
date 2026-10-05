@@ -302,6 +302,8 @@ fn client_url_bridge_lost_result_expires_without_replay_and_releases_capacity() 
 #[test]
 fn client_url_bridge_delayed_plugin_and_popup_keep_invoking_client() {
     use std::fs;
+    let python = support::python_executable();
+    let quoted_python = format!("'{}'", python.to_string_lossy().replace('\'', "'\\''"));
     for popup in [false, true] {
         let root =
             std::env::temp_dir().join(format!("herdr-origin-{}-{}", std::process::id(), popup));
@@ -310,9 +312,9 @@ fn client_url_bridge_delayed_plugin_and_popup_keep_invoking_client() {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/client-url/delayed-plugin.py"
         );
-        fs::write(root.join("herdr-plugin.toml"),format!("id = \"test.origin\"\nname = \"Origin\"\nversion = \"0.1.0\"\nmin_herdr_version = \"0.6.10\"\n[[actions]]\nid = \"open\"\ntitle = \"Open\"\ncommand = {}\n",serde_json::json!(["/usr/bin/python3",script,root]))).unwrap();
+        fs::write(root.join("herdr-plugin.toml"),format!("id = \"test.origin\"\nname = \"Origin\"\nversion = \"0.1.0\"\nmin_herdr_version = \"0.6.10\"\n[[actions]]\nid = \"open\"\ntitle = \"Open\"\ncommand = {}\n",serde_json::json!([python,script,root]))).unwrap();
         let command = if popup {
-            format!("/usr/bin/python3 {script} {}", root.display())
+            format!("{quoted_python} {script} {}", root.display())
         } else {
             "test.origin.open".into()
         };
@@ -358,13 +360,15 @@ fn client_url_bridge_delayed_plugin_and_popup_keep_invoking_client() {
 #[test]
 fn client_url_bridge_disconnected_plugin_origin_never_retargets() {
     use std::fs;
+    let python = support::python_executable();
+    let quoted_python = format!("'{}'", python.to_string_lossy().replace('\'', "'\\''"));
     let root = std::env::temp_dir().join(format!("herdr-origin-disconnect-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
     let script = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/client-url/delayed-plugin.py"
     );
-    let command = format!("/usr/bin/python3 {script} {}", root.display());
+    let command = format!("{quoted_python} {script} {}", root.display());
     let config = format!(
         "onboarding=false\n[[keys.command]]\nkey=\"alt+w\"\ntype=\"popup\"\ncommand={}\n",
         serde_json::to_string(&command).unwrap()
@@ -448,7 +452,7 @@ fn client_url_bridge_untrusted_context_and_agent_terminal_do_not_pin_origin() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/client-url/delayed-plugin.py"
     );
-    fs::write(root.join("herdr-plugin.toml"), format!("id=\"test.untrusted\"\nname=\"Untrusted\"\nversion=\"0.1.0\"\nmin_herdr_version=\"0.6.10\"\n[[actions]]\nid=\"open\"\ntitle=\"Open\"\ncommand={}\n", json!(["/usr/bin/python3",script,root]))).unwrap();
+    fs::write(root.join("herdr-plugin.toml"), format!("id=\"test.untrusted\"\nname=\"Untrusted\"\nversion=\"0.1.0\"\nmin_herdr_version=\"0.6.10\"\n[[actions]]\nid=\"open\"\ntitle=\"Open\"\ncommand={}\n", json!([support::python_executable(),script,root]))).unwrap();
     assert!(f
         .call("plugin.link", json!({"path":root,"enabled":true}))
         .get("result")
@@ -483,9 +487,12 @@ fn client_url_bridge_untrusted_context_and_agent_terminal_do_not_pin_origin() {
     );
     let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
     let target = f.artifact_dir.join("terminal-origin.txt");
+    let completion = f.artifact_dir.join("terminal-origin.done");
     let command = format!(
-        "printf '%s' \"${{HERDR_ORIGIN_CLIENT_ID-unset}}\" > '{}'\n",
-        target.display()
+        ": > '{}'\nsleep 0.15\nprintf '%s' \"${{HERDR_ORIGIN_CLIENT_ID-unset}}\" > '{}'\n: > '{}'\n",
+        target.display(),
+        target.display(),
+        completion.display()
     );
     assert!(f
         .call("pane.send_text", json!({"pane_id":pane,"text":command}))
@@ -494,7 +501,7 @@ fn client_url_bridge_untrusted_context_and_agent_terminal_do_not_pin_origin() {
     assert!(support::wait_until(
         Duration::from_secs(5),
         Duration::from_millis(10),
-        || target.exists()
+        || completion.exists()
     ));
     assert_eq!(fs::read_to_string(target).unwrap(), "unset");
     fs::write(

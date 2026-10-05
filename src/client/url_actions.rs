@@ -278,8 +278,13 @@ mod tests {
                 key: None,
             },
         };
+        let python = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        assert!(python.status.success());
         let argv = vec![
-            "/usr/bin/python3".into(),
+            String::from_utf8(python.stdout).unwrap().trim().to_owned(),
             script.to_string_lossy().into_owned(),
             events.to_string_lossy().into_owned(),
         ];
